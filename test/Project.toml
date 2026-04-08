@@ -10,7 +10,8 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
 [compat]
-CSV = "0.10.16"
 Arrow = "2.8.1"
+CSV = "0.10.16"
 DBInterface = "2.6.1"
 Tables = "1.12.1"
+TimeZones = "1.22.2"
