@@ -1,0 +1,7 @@
+name = "XPostCollector"
+uuid = "db9dce3e-f0f0-43fa-927a-c00bbfc647da"
+authors = ["Nakajima, Yukihiro <yukihiro@sfc.keio.ac.jp>"]
+version = "0.0.1"
+
+[compat]
+julia = "1.12"
