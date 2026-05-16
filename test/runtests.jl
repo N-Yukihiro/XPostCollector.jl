@@ -29,6 +29,7 @@ using XPostCollector:
     handle_stream_line!,
     _process_stream_chunk!,
     _flush_pending_stream_line!,
+    _read_stream_lines!,
     _stream_response_outcome,
     _stream_reconnect_decision,
     DT_FMT_ISO,
@@ -189,6 +190,20 @@ function with_env_token(f::Function)
     Base.withenv("BEARER_TOKEN" => "dummy") do
         f()
     end
+end
+
+mutable struct FakeReadavailableStream
+    chunks::Vector{Vector{UInt8}}
+    calls::Int
+end
+
+FakeReadavailableStream(chunks::Vector{Vector{UInt8}}) =
+    FakeReadavailableStream(chunks, 0)
+
+function Base.readavailable(s::FakeReadavailableStream)
+    s.calls += 1
+    isempty(s.chunks) && return UInt8[]
+    return popfirst!(s.chunks)
 end
 
 # ---------------------------------------------------------
@@ -1143,8 +1158,21 @@ end
                         return Dict("meta" => Dict("summary" => Dict("not_deleted" => 1)))
                     end
                     return Dict("data" => Any[])
-                end
+            end
             @test_throws ErrorException ensure_stream_rule!(cfg, headers, delete_failure_stub)
+
+            methods = String[]
+            missing_id_stub =
+                (method, url, headers, params; body = nothing, max_retries = 6, readtimeout = 30) -> begin
+                    push!(methods, method)
+                    method == "GET" &&
+                        return Dict(
+                            "data" => Any[Dict("value" => "other", "tag" => cfg.rule_tag)],
+                        )
+                    error("delete should not be called when conflicting rule id is missing")
+                end
+            @test_throws ErrorException ensure_stream_rule!(cfg, headers, missing_id_stub)
+            @test methods == ["GET"]
         end
     end
 end
@@ -1293,6 +1321,107 @@ end
             lines = readlines(out_jsonl(cfg))
             @test count(ln -> occursin("\"kind\":\"tweet\"", ln), lines) == 2
             @test count(ln -> occursin("\"endpoint\":\"stream\"", ln), lines) == 1
+        end
+    end
+end
+
+@testset "stream read loop handles empty chunks without spinning" begin
+    with_temp_stream_cfg(task = "stream_empty_chunk") do cfg, dir
+        with_logger(NullLogger()) do
+            st = StreamState()
+            st.task_name = cfg.task_name
+            st.query = build_query(cfg)
+            st.rule_tag = cfg.rule_tag
+            sdb = init_seen_db(cfg)
+            try
+                open(out_jsonl(cfg), "w") do io
+                    stream = FakeReadavailableStream(Vector{UInt8}[UInt8[]])
+                    activity = Ref(false)
+                    outcome = _read_stream_lines!(cfg, st, sdb, io, stream, time(), activity)
+                    @test outcome.kind == :disconnected
+                    @test outcome.stop_reason == "disconnected"
+                    @test outcome.activity == false
+                    @test activity[] == false
+                    @test stream.calls == 1
+                end
+            finally
+                DBInterface.close!(sdb.db)
+            end
+            @test readlines(out_jsonl(cfg)) == String[]
+        end
+    end
+
+    with_temp_stream_cfg(task = "stream_empty_after_pending") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.max_posts = 0
+            st = StreamState()
+            st.task_name = cfg.task_name
+            st.query = build_query(cfg)
+            st.rule_tag = cfg.rule_tag
+            sdb = init_seen_db(cfg)
+            try
+                open(out_jsonl(cfg), "w") do io
+                    tweet = Dict(
+                        "id" => "300",
+                        "created_at" => "2026-01-01T00:00:00Z",
+                        "author_id" => "30",
+                        "lang" => "ja",
+                        "text" => "pending before empty",
+                    )
+                    event = String(JSON3.write(Dict("data" => tweet)))
+                    stream = FakeReadavailableStream(
+                        Vector{UInt8}[collect(codeunits(event)), UInt8[]],
+                    )
+                    activity = Ref(false)
+                    outcome = _read_stream_lines!(cfg, st, sdb, io, stream, time(), activity)
+                    @test outcome.kind == :disconnected
+                    @test outcome.stop_reason == "disconnected"
+                    @test outcome.activity == true
+                    @test activity[] == true
+                    @test st.total_tweets == 1
+                    @test stream.calls == 2
+                end
+            finally
+                DBInterface.close!(sdb.db)
+            end
+            lines = readlines(out_jsonl(cfg))
+            @test count(ln -> occursin("\"kind\":\"tweet\"", ln), lines) == 1
+            @test count(ln -> occursin("\"endpoint\":\"stream\"", ln), lines) == 1
+        end
+    end
+
+    with_temp_stream_cfg(task = "stream_empty_after_max_posts") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.max_posts = 1
+            st = StreamState()
+            st.task_name = cfg.task_name
+            st.query = build_query(cfg)
+            st.rule_tag = cfg.rule_tag
+            sdb = init_seen_db(cfg)
+            try
+                open(out_jsonl(cfg), "w") do io
+                    tweet = Dict(
+                        "id" => "301",
+                        "created_at" => "2026-01-01T00:00:00Z",
+                        "author_id" => "31",
+                        "lang" => "ja",
+                        "text" => "pending max posts",
+                    )
+                    event = String(JSON3.write(Dict("data" => tweet)))
+                    stream = FakeReadavailableStream(
+                        Vector{UInt8}[collect(codeunits(event)), UInt8[]],
+                    )
+                    activity = Ref(false)
+                    outcome = _read_stream_lines!(cfg, st, sdb, io, stream, time(), activity)
+                    @test outcome.kind == :completed
+                    @test outcome.stop_reason == "max_posts"
+                    @test outcome.activity == true
+                    @test st.completed == true
+                    @test st.stop_reason == "max_posts"
+                end
+            finally
+                DBInterface.close!(sdb.db)
+            end
         end
     end
 end

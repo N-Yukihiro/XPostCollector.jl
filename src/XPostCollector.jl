@@ -1256,6 +1256,24 @@ function _find_stream_rule(obj, tag::AbstractString, value::AbstractString)
     return nothing
 end
 
+function _stream_rule_delete_ids_or_error(rules, tag::AbstractString)::Vector{String}
+    ids = String[]
+    missing_values = String[]
+    for r in rules
+        if isempty(r.id)
+            push!(missing_values, r.value)
+        else
+            push!(ids, r.id)
+        end
+    end
+    if !isempty(missing_values)
+        detail = join(missing_values, "; ")
+        error("Stream rule tag '$tag' cannot be replaced because a conflicting rule has no id: $detail")
+    end
+    isempty(ids) && error("Stream rule tag '$tag' cannot be replaced because no rule ids were returned")
+    return ids
+end
+
 function ensure_stream_rule!(cfg::StreamConfig)
     validate!(cfg)
     headers = bearer_headers(user_agent = "julia-x-collector/stream")
@@ -1288,10 +1306,11 @@ function ensure_stream_rule!(cfg::StreamConfig, headers, fetch_json::Function)
         if !cfg.replace_rule_by_tag
             error("Stream rule tag '$tag' already exists with a different value")
         end
+        delete_ids = _stream_rule_delete_ids_or_error(same_tag, tag)
         delete_res = delete_stream_rules!(
             cfg,
             headers,
-            [r.id for r in same_tag if !isempty(r.id)],
+            delete_ids,
             fetch_json,
         )
         _assert_stream_rules_response_ok(delete_res; action = :delete)
@@ -1517,6 +1536,43 @@ function _flush_pending_stream_line!(
     return _record_stream_line!(cfg, st, sdb, io, line, started_at, activity_ref)
 end
 
+_stream_completed_outcome(stop_reason::AbstractString, activity_ref::Base.RefValue{Bool}) = (
+    kind = :completed,
+    stop_reason = String(stop_reason),
+    sleep_seconds = 0,
+    activity = activity_ref[],
+)
+
+_stream_disconnected_outcome(activity_ref::Base.RefValue{Bool}) = (
+    kind = :disconnected,
+    stop_reason = "disconnected",
+    sleep_seconds = 0,
+    activity = activity_ref[],
+)
+
+function _flush_pending_stream_outcome!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    io::IO,
+    pending_line::IOBuffer,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+)
+    res = _flush_pending_stream_line!(
+        cfg,
+        st,
+        sdb,
+        io,
+        pending_line,
+        started_at,
+        activity_ref,
+    )
+    res.stop_reason !== nothing &&
+        return _stream_completed_outcome(res.stop_reason, activity_ref)
+    return nothing
+end
+
 function _read_stream_lines!(
     cfg::StreamConfig,
     st::StreamState,
@@ -1530,6 +1586,19 @@ function _read_stream_lines!(
     try
         while true
             chunk = readavailable(http)
+            if isempty(chunk)
+                outcome = _flush_pending_stream_outcome!(
+                    cfg,
+                    st,
+                    sdb,
+                    io,
+                    pending_line,
+                    started_at,
+                    activity_ref,
+                )
+                outcome !== nothing && return outcome
+                return _stream_disconnected_outcome(activity_ref)
+            end
             res = _process_stream_chunk!(
                 cfg,
                 st,
@@ -1541,16 +1610,11 @@ function _read_stream_lines!(
                 activity_ref,
             )
             if res.stop_reason !== nothing
-                return (
-                    kind = :completed,
-                    stop_reason = res.stop_reason,
-                    sleep_seconds = 0,
-                    activity = activity_ref[],
-                )
+                return _stream_completed_outcome(res.stop_reason, activity_ref)
             end
         end
     catch e
-        res = _flush_pending_stream_line!(
+        outcome = _flush_pending_stream_outcome!(
             cfg,
             st,
             sdb,
@@ -1559,14 +1623,7 @@ function _read_stream_lines!(
             started_at,
             activity_ref,
         )
-        if res.stop_reason !== nothing
-            return (
-                kind = :completed,
-                stop_reason = res.stop_reason,
-                sleep_seconds = 0,
-                activity = activity_ref[],
-            )
-        end
+        outcome !== nothing && return outcome
         rethrow(e)
     end
 end
