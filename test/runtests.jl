@@ -13,6 +13,7 @@ using XPostCollector:
     out_arrow,
     out_csv_wide,
     out_stream_state,
+    out_stream_gaps,
     save_state,
     load_state,
     init_seen_db,
@@ -32,6 +33,11 @@ using XPostCollector:
     _read_stream_lines!,
     _stream_response_outcome,
     _stream_reconnect_decision,
+    _open_stream_jsonl_writer,
+    _close_stream_jsonl_writer!,
+    _rotate_stream_jsonl_if_needed!,
+    _write_stream_gap!,
+    stream_jsonl_paths,
     DT_FMT_ISO,
     MAX_RESULTS_ALL,
     HTTP,
@@ -178,6 +184,39 @@ function jsonl_page_line(page::Int = 1; meta = Dict("result_count" => 0))
     return String(JSON3.write(obj))
 end
 
+function stream_event_json(
+    id::String;
+    text = "hello stream",
+    author_id = "42",
+    username = "alice",
+)
+    event = Dict{String,Any}(
+        "data" => Dict(
+            "id" => id,
+            "text" => text,
+            "created_at" => "2026-01-01T00:00:00Z",
+            "author_id" => author_id,
+            "public_metrics" => Dict(
+                "like_count" => 1,
+                "retweet_count" => 0,
+                "reply_count" => 0,
+                "quote_count" => 0,
+            ),
+        ),
+        "includes" => Dict(
+            "users" => [
+                Dict(
+                    "id" => author_id,
+                    "username" => username,
+                    "name" => "Alice",
+                ),
+            ],
+        ),
+        "matching_rules" => [Dict("id" => "r1", "tag" => "tag1")],
+    )
+    return String(JSON3.write(event))
+end
+
 fixture_path(name::AbstractString) = joinpath(@__DIR__, "fixtures", name)
 
 function read_fixture(name::AbstractString)
@@ -205,6 +244,14 @@ function Base.readavailable(s::FakeReadavailableStream)
     isempty(s.chunks) && return UInt8[]
     return popfirst!(s.chunks)
 end
+
+struct FailingIO <: IO end
+Base.write(::FailingIO, ::UInt8) = error("write failed")
+Base.write(::FailingIO, ::StridedVector{UInt8}) = error("write failed")
+Base.write(::FailingIO, ::AbstractVector{UInt8}) = error("write failed")
+Base.write(::FailingIO, ::AbstractString) = error("write failed")
+Base.write(::FailingIO, ::Char) = error("write failed")
+Base.flush(::FailingIO) = nothing
 
 # ---------------------------------------------------------
 # validate!
@@ -249,6 +296,9 @@ end
         max_posts = -1,
         max_seconds = -1,
         idle_timeout_seconds = 0,
+        rotate_jsonl_bytes = -1,
+        rotate_jsonl_seconds = -1,
+        state_flush_interval_seconds = -1,
     )
     validate!(cfg)
     @test cfg.api_base_url == "http://127.0.0.1:8080"
@@ -256,6 +306,10 @@ end
     @test cfg.max_posts == 0
     @test cfg.max_seconds == 0.0
     @test cfg.idle_timeout_seconds == 1
+    @test cfg.max_reconnects == 0
+    @test cfg.rotate_jsonl_bytes == 0
+    @test cfg.rotate_jsonl_seconds == 0.0
+    @test cfg.state_flush_interval_seconds == 0.0
 
     params = build_stream_params(cfg)
     @test haskey(params, "tweet.fields")
@@ -1205,6 +1259,14 @@ end
     @test second.should_reconnect == false
     @test second.stop_reason == "max_reconnects_exceeded"
 
+    unlimited = StreamConfig(task_name = "stream_retry_unlimited", keywords_or = ["foo"])
+    validate!(unlimited)
+    @test unlimited.max_reconnects == 0
+    u1 = _stream_reconnect_decision(unlimited, 10_000)
+    @test u1.should_reconnect == true
+    @test u1.reconnects == 10_001
+    @test u1.stop_reason == ""
+
     cfg.reconnect = false
     disabled = _stream_reconnect_decision(cfg, 0)
     @test disabled.should_reconnect == false
@@ -1260,6 +1322,240 @@ end
             @test length(rows) == 1
             @test rows[1].author_username == "alice"
         end
+    end
+end
+
+@testset "stream persistence is durable before seen DB and throttles keepalive state" begin
+    with_temp_stream_cfg(task = "stream_persist_safety") do cfg, dir
+        with_logger(NullLogger()) do
+            st = StreamState()
+            st.task_name = cfg.task_name
+            st.query = build_query(cfg)
+            st.rule_tag = cfg.rule_tag
+            sdb = init_seen_db(cfg)
+            try
+                @test_throws ErrorException handle_stream_line!(
+                    cfg,
+                    st,
+                    sdb,
+                    FailingIO(),
+                    stream_event_json("write-fail"),
+                )
+                @test mark_seen!(sdb, "write-fail", utc_now_z(lag_seconds = 0)) == true
+            finally
+                DBInterface.close!(sdb.db)
+            end
+        end
+    end
+
+    with_temp_stream_cfg(task = "stream_state_throttle") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.state_flush_interval_seconds = 3600.0
+            st = StreamState()
+            st.task_name = cfg.task_name
+            st.query = build_query(cfg)
+            st.rule_tag = cfg.rule_tag
+            sdb = init_seen_db(cfg)
+            try
+                open(out_jsonl(cfg), "w") do io
+                    pending = IOBuffer()
+                    activity = Ref(false)
+                    state_flush_ref = Ref(time())
+                    res = _process_stream_chunk!(
+                        cfg,
+                        st,
+                        sdb,
+                        io,
+                        pending,
+                        collect(codeunits("\n")),
+                        time(),
+                        activity,
+                        state_flush_ref,
+                    )
+                    @test res.result == :pending
+                    @test st.keepalive_count == 1
+                    @test st.last_heartbeat_at != ""
+                    @test activity[] == true
+                    @test !isfile(out_stream_state(cfg))
+                end
+            finally
+                DBInterface.close!(sdb.db)
+            end
+        end
+    end
+end
+
+@testset "stream JSONL rotation converts across rotated files" begin
+    with_temp_stream_cfg(task = "stream_rotate") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.emit_arrow = false
+            cfg.rotate_jsonl_bytes = 1
+            cfg.max_posts = 0
+            st = StreamState()
+            st.task_name = cfg.task_name
+            st.query = build_query(cfg)
+            st.rule_tag = cfg.rule_tag
+            sdb = init_seen_db(cfg)
+            writer = _open_stream_jsonl_writer(cfg)
+            try
+                @test handle_stream_line!(cfg, st, sdb, writer, stream_event_json("rot-1")) == :tweet
+                @test handle_stream_line!(cfg, st, sdb, writer, stream_event_json("rot-2")) == :tweet
+            finally
+                _close_stream_jsonl_writer!(writer)
+                DBInterface.close!(sdb.db)
+            end
+
+            paths = stream_jsonl_paths(cfg)
+            @test length(paths) == 2
+            @test occursin(".rot-", basename(paths[1]))
+            @test paths[end] == out_jsonl(cfg)
+
+            convert_outputs(cfg)
+            convert_outputs_wide(cfg)
+            @test count_csv_rows(out_csv(cfg)) == 2
+            @test count_csv_rows(out_csv_wide(cfg)) == 2
+        end
+    end
+end
+
+@testset "stream conversion retries active partial final lines" begin
+    with_temp_stream_cfg(task = "stream_partial_convert") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.emit_arrow = false
+            cfg.convert_incremental = true
+            good = jsonl_tweet_line("partial-1")
+            partial = jsonl_tweet_line("partial-2")
+            prefix = first(partial, length(partial) - 5)
+            suffix = last(partial, 5)
+
+            open(out_jsonl(cfg), "w") do io
+                write(io, good)
+                write(io, '\n')
+                write(io, prefix)
+            end
+
+            first_res = convert_outputs(cfg)
+            @test count_csv_rows(out_csv(cfg)) == 1
+            @test first_res.converted_offset == ncodeunits(good) + 1
+            st = load_state(joinpath(dir, "$(cfg.task_name).state.json"))
+            @test st.converted_jsonl_offset == ncodeunits(good) + 1
+
+            open(out_jsonl(cfg), "a") do io
+                write(io, suffix)
+                write(io, '\n')
+            end
+            second_res = convert_outputs(cfg)
+            @test second_res.converted_offset == stat(out_jsonl(cfg)).size
+            @test count_csv_rows(out_csv(cfg)) == 2
+        end
+    end
+
+    with_temp_stream_cfg(task = "stream_partial_wide") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.emit_arrow = false
+            cfg.convert_incremental = true
+            good_lines = [jsonl_tweet_line("wide-1"), jsonl_page_line(1)]
+            good_bytes = sum(ncodeunits(ln) + 1 for ln in good_lines)
+            partial = jsonl_tweet_line("wide-2")
+            prefix = first(partial, length(partial) - 5)
+            suffix = last(partial, 5)
+
+            open(out_jsonl(cfg), "w") do io
+                for ln in good_lines
+                    write(io, ln)
+                    write(io, '\n')
+                end
+                write(io, prefix)
+            end
+
+            first_res = convert_outputs_wide(cfg)
+            @test count_csv_rows(out_csv_wide(cfg)) == 1
+            @test first_res.converted_offset == good_bytes
+            st = load_state(joinpath(dir, "$(cfg.task_name).wide.state.json"))
+            @test st.converted_jsonl_offset == good_bytes
+
+            open(out_jsonl(cfg), "a") do io
+                write(io, suffix)
+                write(io, '\n')
+            end
+            second_res = convert_outputs_wide(cfg)
+            @test second_res.converted_offset == stat(out_jsonl(cfg)).size
+            @test count_csv_rows(out_csv_wide(cfg)) == 2
+        end
+    end
+end
+
+@testset "stream conversion skips corrupt rotated lines" begin
+    with_temp_stream_cfg(task = "stream_rotated_corrupt") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.emit_arrow = false
+            rotated = joinpath(dir, "$(cfg.task_name).rot-20260101T000000-000001.jsonl")
+            bad = jsonl_tweet_line("rot-bad")
+            open(rotated, "w") do io
+                write(io, jsonl_tweet_line("rot-good-1"))
+                write(io, '\n')
+                write(io, first(bad, length(bad) - 5))
+            end
+            open(out_jsonl(cfg), "w") do io
+                write(io, jsonl_tweet_line("rot-good-2"))
+                write(io, '\n')
+            end
+
+            res = convert_outputs(cfg)
+            @test count_csv_rows(out_csv(cfg)) == 2
+            @test res.converted_offset == stat(rotated).size + stat(out_jsonl(cfg)).size
+        end
+    end
+end
+
+@testset "stream rotation failure reopens active writer" begin
+    with_temp_stream_cfg(task = "stream_rotate_recover") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.rotate_jsonl_bytes = 1
+            writer = _open_stream_jsonl_writer(cfg)
+            try
+                write(writer.io, "seed\n")
+                flush(writer.io)
+                fail_move = (src, dst; force = false) -> error("mv failed")
+                @test_throws ErrorException _rotate_stream_jsonl_if_needed!(
+                    cfg,
+                    writer;
+                    move_file = fail_move,
+                )
+                @test isopen(writer.io)
+                write(writer.io, "after\n")
+                flush(writer.io)
+            finally
+                _close_stream_jsonl_writer!(writer)
+            end
+            @test occursin("seed\n", read(out_jsonl(cfg), String))
+            @test occursin("after\n", read(out_jsonl(cfg), String))
+        end
+    end
+end
+
+@testset "stream gap records capture reconnect windows" begin
+    with_temp_stream_cfg(task = "stream_gap") do cfg, dir
+        st = StreamState()
+        st.task_name = cfg.task_name
+        st.query = build_query(cfg)
+        st.rule_tag = cfg.rule_tag
+        st.rule_id = "rule-1"
+        _write_stream_gap!(
+            cfg,
+            st,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:30Z",
+            "disconnected",
+        )
+        lines = readlines(out_stream_gaps(cfg))
+        @test length(lines) == 1
+        obj = JSON3.read(lines[1])
+        @test obj["task_name"] == cfg.task_name
+        @test obj["query"] == st.query
+        @test obj["start_time_utc"] == "2026-01-01T00:00:00Z"
+        @test obj["end_time_utc"] == "2026-01-01T00:00:30Z"
+        @test obj["reason"] == "disconnected"
     end
 end
 
