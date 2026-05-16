@@ -1,7 +1,16 @@
 module XPostCollector
 
 export SearchConfig,
-    CollectorState, validate!, run_collector, convert_outputs, convert_outputs_wide
+    StreamConfig,
+    CollectorState,
+    StreamState,
+    validate!,
+    run_collector,
+    run_stream_collector,
+    list_stream_rules,
+    ensure_stream_rule!,
+    convert_outputs,
+    convert_outputs_wide
 
 using HTTP
 using JSON3
@@ -20,13 +29,30 @@ using CSV
 # =========================================================
 # API endpoints
 # =========================================================
-const URL_RECENT = "https://api.x.com/2/tweets/search/recent"
-const URL_ALL = "https://api.x.com/2/tweets/search/all"
+const API_BASE_URL_DEFAULT = "https://api.x.com"
+const PATH_RECENT = "/2/tweets/search/recent"
+const PATH_ALL = "/2/tweets/search/all"
+const PATH_STREAM = "/2/tweets/search/stream"
+const PATH_STREAM_RULES = "/2/tweets/search/stream/rules"
+const PATH_USAGE = "/2/usage/tweets"
+
+normalize_api_base_url(url::AbstractString) = rstrip(strip(String(url)), '/')
+api_url(base_url::AbstractString, path::AbstractString) =
+    normalize_api_base_url(base_url) * "/" * lstrip(String(path), '/')
+
+const URL_RECENT = api_url(API_BASE_URL_DEFAULT, PATH_RECENT)
+const URL_ALL = api_url(API_BASE_URL_DEFAULT, PATH_ALL)
+const URL_STREAM = api_url(API_BASE_URL_DEFAULT, PATH_STREAM)
+const URL_STREAM_RULES = api_url(API_BASE_URL_DEFAULT, PATH_STREAM_RULES)
 
 # usage endpoint はプラン/仕様で変わり得るので「設定で差し替え前提」にする
-const URL_USAGE_DEFAULT = "https://api.x.com/2/usage/tweets"
+const URL_USAGE_DEFAULT = api_url(API_BASE_URL_DEFAULT, PATH_USAGE)
 
 endpoint_url(endpoint::Symbol) = endpoint === :all ? URL_ALL : URL_RECENT
+endpoint_path(endpoint::Symbol) = endpoint === :all ? PATH_ALL : PATH_RECENT
+endpoint_url(cfg, endpoint::Symbol) = api_url(cfg.api_base_url, endpoint_path(endpoint))
+stream_url(cfg) = api_url(cfg.api_base_url, PATH_STREAM)
+stream_rules_url(cfg) = api_url(cfg.api_base_url, PATH_STREAM_RULES)
 
 # =========================================================
 # Time / format
@@ -163,6 +189,7 @@ Base.@kwdef mutable struct SearchConfig
     usage_fields::String = "project_cap,project_usage,cap_reset_day"
 
     # リクエストパラメータ
+    api_base_url::String = API_BASE_URL_DEFAULT
     max_results::Int = 100
     write_includes::Bool = true
     force_resume_on_mismatch::Bool = false
@@ -185,6 +212,42 @@ Base.@kwdef mutable struct SearchConfig
     arrow_append::Bool = true
 end
 
+Base.@kwdef mutable struct StreamConfig
+    task_name::String
+    keywords_or::Vector{String}
+
+    extra_query_tail::String = ""
+    exclude_reposts::Bool = true
+
+    api_base_url::String = API_BASE_URL_DEFAULT
+    rule_tag::String = ""
+    manage_rules::Bool = true
+    replace_rule_by_tag::Bool = false
+
+    max_posts::Int = 0
+    max_seconds::Float64 = 0.0
+    idle_timeout_seconds::Int = 30
+
+    reconnect::Bool = true
+    max_reconnects::Int = 10
+    reconnect_initial_delay_seconds::Float64 = 5.0
+    reconnect_max_delay_seconds::Float64 = 60.0
+
+    write_includes::Bool = true
+
+    out_dir::String = "."
+    log_dir::String = "logs"
+    db_path::String = ""
+
+    convert_incremental::Bool = true
+    convert_batch_size::Int = 50_000
+
+    emit_csv::Bool = true
+    emit_arrow::Bool = false
+    arrow_path::String = ""
+    arrow_append::Bool = true
+end
+
 out_jsonl(cfg::SearchConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).jsonl")
 out_state(cfg::SearchConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).state.json")
 out_csv(cfg::SearchConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).csv")
@@ -195,6 +258,36 @@ out_db(cfg::SearchConfig) =
     isempty(cfg.db_path) ? joinpath(cfg.out_dir, "$(cfg.task_name).seen.sqlite") :
     cfg.db_path
 out_log(cfg::SearchConfig) = joinpath(cfg.log_dir, "$(cfg.task_name).log")
+
+out_jsonl(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).jsonl")
+out_stream_state(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).stream.state.json")
+out_csv(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).csv")
+out_arrow(cfg::StreamConfig) =
+    isempty(cfg.arrow_path) ? joinpath(cfg.out_dir, "$(cfg.task_name).arrow") :
+    cfg.arrow_path
+out_db(cfg::StreamConfig) =
+    isempty(cfg.db_path) ? joinpath(cfg.out_dir, "$(cfg.task_name).seen.sqlite") :
+    cfg.db_path
+out_log(cfg::StreamConfig) = joinpath(cfg.log_dir, "$(cfg.task_name).log")
+
+function as_search_config(cfg::StreamConfig)
+    return SearchConfig(
+        task_name = cfg.task_name,
+        keywords_or = copy(cfg.keywords_or),
+        extra_query_tail = cfg.extra_query_tail,
+        exclude_reposts = cfg.exclude_reposts,
+        api_base_url = cfg.api_base_url,
+        out_dir = cfg.out_dir,
+        log_dir = cfg.log_dir,
+        db_path = cfg.db_path,
+        convert_incremental = cfg.convert_incremental,
+        convert_batch_size = cfg.convert_batch_size,
+        emit_csv = cfg.emit_csv,
+        emit_arrow = cfg.emit_arrow,
+        arrow_path = cfg.arrow_path,
+        arrow_append = cfg.arrow_append,
+    )
+end
 
 function validate!(cfg::SearchConfig)
     isempty(cfg.task_name) && error("task_name is empty")
@@ -218,8 +311,33 @@ function validate!(cfg::SearchConfig)
 
     # max_results は validate では ALL 側の上限まで許容し、endpoint確定後に再クランプする
     cfg.max_results = clamp(cfg.max_results, 10, MAX_RESULTS_ALL)
+    cfg.api_base_url = normalize_api_base_url(cfg.api_base_url)
+    isempty(cfg.api_base_url) && error("api_base_url is empty")
 
     TimeZone(cfg.local_tz_name)
+    return cfg
+end
+
+function validate!(cfg::StreamConfig)
+    isempty(cfg.task_name) && error("task_name is empty")
+    isempty(cfg.keywords_or) && error("keywords_or is empty")
+
+    cfg.api_base_url = normalize_api_base_url(cfg.api_base_url)
+    isempty(cfg.api_base_url) && error("api_base_url is empty")
+
+    cfg.rule_tag = strip(cfg.rule_tag)
+    isempty(cfg.rule_tag) && (cfg.rule_tag = cfg.task_name)
+
+    cfg.max_posts = max(cfg.max_posts, 0)
+    cfg.max_seconds = max(cfg.max_seconds, 0.0)
+    cfg.idle_timeout_seconds = max(cfg.idle_timeout_seconds, 1)
+    cfg.max_reconnects = max(cfg.max_reconnects, 0)
+    cfg.reconnect_initial_delay_seconds =
+        max(cfg.reconnect_initial_delay_seconds, 0.1)
+    cfg.reconnect_max_delay_seconds =
+        max(cfg.reconnect_max_delay_seconds, cfg.reconnect_initial_delay_seconds)
+    cfg.convert_batch_size = max(cfg.convert_batch_size, 1)
+
     return cfg
 end
 
@@ -244,6 +362,24 @@ end
 CollectorState() =
     CollectorState("", "", "", nothing, nothing, nothing, 0, 0, 0, false, 0, "")
 StructTypes.StructType(::Type{CollectorState}) = StructTypes.Mutable()
+
+mutable struct StreamState
+    timestamp::String
+    task_name::String
+    query::String
+    rule_id::Union{Nothing,String}
+    rule_tag::String
+    connection_count::Int
+    total_tweets::Int
+    total_includes::Int
+    keepalive_count::Int
+    last_event_at::String
+    completed::Bool
+    stop_reason::String
+end
+
+StreamState() = StreamState("", "", "", nothing, "", 0, 0, 0, 0, "", false, "")
+StructTypes.StructType(::Type{StreamState}) = StructTypes.Mutable()
 
 # =========================================================
 # Logging: Base Loggingだけで動く DualLogger
@@ -295,7 +431,7 @@ function Logging.handle_message(
     return nothing
 end
 
-function setup_logging(cfg::SearchConfig; level::LogLevel = Logging.Info)
+function setup_logging(cfg; level::LogLevel = Logging.Info)
     mkpath(cfg.log_dir)
 
     if _LOG_IO[] !== nothing
@@ -382,6 +518,10 @@ function save_state(path::AbstractString, st::CollectorState)
     atomic_write(path, Vector{UInt8}(JSON3.write(st)))
 end
 
+function save_state(path::AbstractString, st::StreamState)
+    atomic_write(path, Vector{UInt8}(JSON3.write(st)))
+end
+
 function load_state(path::AbstractString)::Union{Nothing,CollectorState}
     !isfile(path) && return nothing
     try
@@ -390,6 +530,18 @@ function load_state(path::AbstractString)::Union{Nothing,CollectorState}
         return st
     catch e
         @warn "State file unreadable; start fresh" path = path exception = e
+        return nothing
+    end
+end
+
+function load_stream_state(path::AbstractString)::Union{Nothing,StreamState}
+    !isfile(path) && return nothing
+    try
+        st = StreamState()
+        JSON3.read!(read(path, String), st)
+        return st
+    catch e
+        @warn "Stream state file unreadable; start fresh" path = path exception = e
         return nothing
     end
 end
@@ -430,14 +582,23 @@ function quote_term(t::AbstractString)
     occursin(r"\s", s) ? "\"$(replace(s, "\""=>"\\\""))\"" : s
 end
 
-function build_query(cfg::SearchConfig)::String
-    terms = filter(!isempty, quote_term.(cfg.keywords_or))
+function _build_query(
+    keywords_or::Vector{String},
+    extra_query_tail::AbstractString,
+    exclude_reposts::Bool,
+)::String
+    terms = filter(!isempty, quote_term.(keywords_or))
     isempty(terms) && error("no valid keyword")
     base = "(" * join(terms, " OR ") * ")"
-    tail = strip(cfg.extra_query_tail)
+    tail = strip(String(extra_query_tail))
     q = isempty(tail) ? base : "$base $tail"
-    cfg.exclude_reposts ? "$q -is:retweet" : q
+    exclude_reposts ? "$q -is:retweet" : q
 end
+
+build_query(cfg::SearchConfig)::String =
+    _build_query(cfg.keywords_or, cfg.extra_query_tail, cfg.exclude_reposts)
+build_query(cfg::StreamConfig)::String =
+    _build_query(cfg.keywords_or, cfg.extra_query_tail, cfg.exclude_reposts)
 
 # =========================================================
 # Endpoint selection
@@ -540,7 +701,7 @@ struct SeenDB
     stmt_changes::SQLite.Stmt
 end
 
-function init_seen_db(cfg::SearchConfig)::SeenDB
+function init_seen_db(cfg)::SeenDB
     db = SQLite.DB(out_db(cfg))
 
     # ★ 追加: ロック競合で即死しないよう待つ
@@ -901,6 +1062,705 @@ write_jsonl(io::IO, kind::AbstractString, data) =
     (JSON3.write(io, (; kind = kind, data = data)); write(io, '\n'))
 
 # =========================================================
+# Filtered Stream
+# =========================================================
+function bearer_headers(; user_agent::AbstractString = "julia-x-collector/repl")
+    token = get(ENV, "BEARER_TOKEN", "")
+    isempty(token) && error("BEARER_TOKEN is missing (env/.env)")
+    return ["Authorization" => "Bearer $token", "User-Agent" => String(user_agent)]
+end
+
+function fetch_stream_json_with_retry(
+    method::AbstractString,
+    url::AbstractString,
+    headers,
+    params::Dict{String,String} = Dict{String,String}();
+    body = nothing,
+    max_retries::Int = 6,
+    readtimeout::Int = 30,
+)
+    wait_sec = 5.0
+    request_headers = collect(headers)
+    request_body = UInt8[]
+    if body !== nothing
+        push!(request_headers, "Content-Type" => "application/json")
+        request_body = Vector{UInt8}(JSON3.write(body))
+    end
+
+    for attempt = 1:max_retries
+        resp = try
+            HTTP.request(
+                String(method),
+                String(url);
+                headers = request_headers,
+                query = params,
+                body = request_body,
+                status_exception = false,
+                readtimeout = readtimeout,
+            )
+        catch e
+            @warn "Stream rules API IO error" attempt = attempt exception = e
+            sleep(wait_sec + rand() * 0.5)
+            wait_sec = min(wait_sec * 1.8, 60.0)
+            continue
+        end
+
+        if resp.status == 200
+            try
+                return JSON3.read(String(resp.body))
+            catch e
+                @warn "Stream rules JSON decode failed" attempt = attempt exception = e
+                sleep(wait_sec + rand() * 0.5)
+                wait_sec = min(wait_sec * 1.6, 60.0)
+            end
+        elseif resp.status == 429
+            s = rate_limit_sleep_seconds(resp)
+            @warn "Stream rules rate limited" sleep_seconds = s
+            sleep(s)
+        elseif 500 <= resp.status < 600
+            @warn "Stream rules server error" status = resp.status attempt = attempt
+            sleep(wait_sec + rand() * 0.5)
+            wait_sec = min(wait_sec * 2.0, 60.0)
+        else
+            body_text = _extract_x_api_error_detail(_body_to_text(resp))
+            throw(XApiAccessError(resp.status, String(url), body_text))
+        end
+    end
+    error("Stream rules max retries exceeded")
+end
+
+build_stream_params(cfg::StreamConfig) = begin
+    params = Dict{String,String}()
+    for (k, v) in API_FIELDS
+        params[k] = v
+    end
+    return params
+end
+
+function list_stream_rules(cfg::StreamConfig)
+    validate!(cfg)
+    return list_stream_rules(cfg, bearer_headers(user_agent = "julia-x-collector/stream"))
+end
+
+function list_stream_rules(cfg::StreamConfig, headers)
+    return list_stream_rules(cfg, headers, fetch_stream_json_with_retry)
+end
+
+function list_stream_rules(cfg::StreamConfig, headers, fetch_json::Function)
+    return fetch_json(
+        "GET",
+        stream_rules_url(cfg),
+        headers,
+        Dict{String,String}(),
+    )
+end
+
+function delete_stream_rules!(
+    cfg::StreamConfig,
+    headers,
+    ids::Vector{String},
+    fetch_json::Function = fetch_stream_json_with_retry,
+)
+    isempty(ids) && return nothing
+    body = Dict("delete" => Dict("ids" => ids))
+    return fetch_json(
+        "POST",
+        stream_rules_url(cfg),
+        headers,
+        Dict{String,String}(),
+        body = body,
+    )
+end
+
+function add_stream_rule!(
+    cfg::StreamConfig,
+    headers,
+    value::AbstractString,
+    tag::AbstractString,
+    fetch_json::Function = fetch_stream_json_with_retry,
+)
+    body = Dict("add" => [Dict("value" => String(value), "tag" => String(tag))])
+    return fetch_json(
+        "POST",
+        stream_rules_url(cfg),
+        headers,
+        Dict{String,String}(),
+        body = body,
+    )
+end
+
+function _rules_data(obj)
+    data = get(obj, "data", nothing)
+    data === nothing && return Any[]
+    return data
+end
+
+function _rule_namedtuple(rule)
+    return (
+        id = safe_str(get(rule, "id", nothing); default = ""),
+        value = safe_str(get(rule, "value", nothing); default = ""),
+        tag = safe_str(get(rule, "tag", nothing); default = ""),
+    )
+end
+
+function _stream_rules_summary(obj)
+    meta = get(obj, "meta", nothing)
+    meta === nothing && return nothing
+    return get(meta, "summary", nothing)
+end
+
+function _stream_rules_summary_count(obj, key::AbstractString)::Int
+    summary = _stream_rules_summary(obj)
+    summary === nothing && return 0
+    return safe_int(get(summary, key, nothing); default = 0)
+end
+
+function _stream_rules_error_detail(obj)::String
+    parts = String[]
+    if haskey(obj, "errors")
+        push!(parts, "errors=$(String(JSON3.write(obj["errors"])))")
+    end
+    summary = _stream_rules_summary(obj)
+    if summary !== nothing
+        push!(parts, "summary=$(String(JSON3.write(summary)))")
+    end
+    return isempty(parts) ? "unknown stream rules API failure" : join(parts, "; ")
+end
+
+function _assert_stream_rules_response_ok(obj; action::Symbol)
+    if haskey(obj, "errors")
+        error("Stream rules API $(action) failed: $(_stream_rules_error_detail(obj))")
+    end
+    if action === :add
+        invalid = _stream_rules_summary_count(obj, "invalid")
+        not_created = _stream_rules_summary_count(obj, "not_created")
+        if invalid > 0 || not_created > 0
+            error("Stream rules API add failed: $(_stream_rules_error_detail(obj))")
+        end
+    elseif action === :delete
+        not_deleted = _stream_rules_summary_count(obj, "not_deleted")
+        if not_deleted > 0
+            error("Stream rules API delete failed: $(_stream_rules_error_detail(obj))")
+        end
+    end
+    return obj
+end
+
+function _find_stream_rule(obj, tag::AbstractString, value::AbstractString)
+    for r in _rules_data(obj)
+        rt = _rule_namedtuple(r)
+        if rt.tag == tag && rt.value == value
+            return rt
+        end
+    end
+    return nothing
+end
+
+function ensure_stream_rule!(cfg::StreamConfig)
+    validate!(cfg)
+    headers = bearer_headers(user_agent = "julia-x-collector/stream")
+    return ensure_stream_rule!(cfg, headers)
+end
+
+function ensure_stream_rule!(cfg::StreamConfig, headers)
+    return ensure_stream_rule!(cfg, headers, fetch_stream_json_with_retry)
+end
+
+function ensure_stream_rule!(cfg::StreamConfig, headers, fetch_json::Function)
+    validate!(cfg)
+    value = build_query(cfg)
+    tag = cfg.rule_tag
+
+    if !cfg.manage_rules
+        return (id = nothing, value = value, tag = tag, created = false, response = nothing)
+    end
+
+    rules = list_stream_rules(cfg, headers, fetch_json)
+    same_tag = [_rule_namedtuple(r) for r in _rules_data(rules) if safe_str(get(r, "tag", nothing); default = "") == tag]
+    for r in same_tag
+        if r.value == value
+            rid = isempty(r.id) ? nothing : r.id
+            return (id = rid, value = value, tag = tag, created = false, response = rules)
+        end
+    end
+
+    if !isempty(same_tag)
+        if !cfg.replace_rule_by_tag
+            error("Stream rule tag '$tag' already exists with a different value")
+        end
+        delete_res = delete_stream_rules!(
+            cfg,
+            headers,
+            [r.id for r in same_tag if !isempty(r.id)],
+            fetch_json,
+        )
+        _assert_stream_rules_response_ok(delete_res; action = :delete)
+    end
+
+    res = add_stream_rule!(cfg, headers, value, tag, fetch_json)
+    _assert_stream_rules_response_ok(res; action = :add)
+    created_rule = _find_stream_rule(res, tag, value)
+    created_rule === nothing &&
+        error("Stream rules API add succeeded but the expected rule was not returned")
+    isempty(created_rule.id) &&
+        error("Stream rules API add succeeded but the created rule id was not returned")
+    rid = created_rule.id
+    return (id = rid, value = value, tag = tag, created = true, response = res)
+end
+
+function _stream_line_payload(line::AbstractString)::Union{Nothing,String}
+    s = strip(String(line))
+    isempty(s) && return nothing
+    if startswith(s, "data:")
+        s = strip(s[6:end])
+        isempty(s) && return nothing
+    end
+    s == "[DONE]" && return nothing
+    return s
+end
+
+function _stream_event_meta(obj, received_at::AbstractString, page_new::Int)
+    meta = Dict{String,Any}("received_at" => String(received_at), "result_count" => page_new)
+    haskey(obj, "matching_rules") && (meta["matching_rules"] = obj["matching_rules"])
+    haskey(obj, "errors") && (meta["errors"] = obj["errors"])
+    haskey(obj, "meta") && (meta["stream_meta"] = obj["meta"])
+    return meta
+end
+
+function _stream_data_items(obj)
+    data = get(obj, "data", nothing)
+    data === nothing && return Any[]
+    if data isa AbstractVector
+        return data
+    end
+    return Any[data]
+end
+
+function handle_stream_line!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    io::IO,
+    line::AbstractString,
+)::Symbol
+    payload = _stream_line_payload(line)
+    if payload === nothing
+        st.keepalive_count += 1
+        return :keepalive
+    end
+
+    obj = try
+        JSON3.read(payload)
+    catch e
+        @warn "Stream JSON parse error (skip)" exception = e line = payload
+        return :invalid
+    end
+
+    page_new = 0
+    if haskey(obj, "data")
+        DBInterface.execute(sdb.db, "BEGIN;")
+        try
+            seen_at = utc_now_z(lag_seconds = 0)
+            for tw in _stream_data_items(obj)
+                tid = safe_str(get(tw, "id", nothing); default = "")
+                isempty(tid) && continue
+                if mark_seen!(sdb, tid, seen_at)
+                    write_jsonl(io, "tweet", tw)
+                    st.total_tweets += 1
+                    page_new += 1
+                end
+            end
+            DBInterface.execute(sdb.db, "COMMIT;")
+        catch e
+            try
+                DBInterface.execute(sdb.db, "ROLLBACK;")
+            catch
+            end
+            rethrow(e)
+        end
+    end
+
+    if cfg.write_includes && page_new > 0 && haskey(obj, "includes")
+        inc = obj["includes"]
+        for (k, arr) in inc
+            kstr = String(k)
+            for item in arr
+                write_jsonl(io, "include:$kstr", item)
+                st.total_includes += 1
+            end
+        end
+    end
+
+    if page_new > 0
+        received_at = string(Dates.now(Dates.UTC))
+        st.last_event_at = received_at
+        write_jsonl(
+            io,
+            "page",
+            Dict(
+                "page" => st.total_tweets,
+                "endpoint" => "stream",
+                "meta" => _stream_event_meta(obj, received_at, page_new),
+            ),
+        )
+        flush(io)
+        return :tweet
+    end
+
+    return haskey(obj, "errors") ? :errors : :ignored
+end
+
+function _stream_stop_reason(cfg::StreamConfig, st::StreamState, started_at::Float64)
+    cfg.max_posts > 0 && st.total_tweets >= cfg.max_posts && return "max_posts"
+    cfg.max_seconds > 0 && (time() - started_at) >= cfg.max_seconds && return "max_seconds"
+    return nothing
+end
+
+function _persist_stream_state!(cfg::StreamConfig, st::StreamState)
+    st.timestamp = string(Dates.now(Dates.UTC))
+    save_state(out_stream_state(cfg), st)
+    return nothing
+end
+
+function _stream_response_body(http)
+    try
+        return String(read(http))
+    catch
+        return ""
+    end
+end
+
+function _throw_stream_response_error(resp, url::AbstractString, body::AbstractString)
+    body_text = _extract_x_api_error_detail(body)
+    throw(XApiAccessError(resp.status, String(url), body_text))
+end
+
+function _stream_response_outcome(resp, url::AbstractString; body::AbstractString = "")
+    resp.status == 200 &&
+        return (kind = :ok, stop_reason = "", sleep_seconds = 0, activity = false)
+    if resp.status == 429
+        return (
+            kind = :retryable,
+            stop_reason = "rate_limited",
+            sleep_seconds = rate_limit_sleep_seconds(resp),
+            activity = false,
+        )
+    elseif 500 <= resp.status < 600
+        return (
+            kind = :retryable,
+            stop_reason = "server_error",
+            sleep_seconds = 0,
+            activity = false,
+        )
+    end
+    _throw_stream_response_error(resp, url, body)
+end
+
+function _record_stream_line!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    io::IO,
+    line::AbstractString,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+)
+    result = handle_stream_line!(cfg, st, sdb, io, line)
+    if result != :invalid
+        activity_ref[] = true
+        st.stop_reason = ""
+    end
+    _persist_stream_state!(cfg, st)
+
+    stop_reason = _stream_stop_reason(cfg, st, started_at)
+    if stop_reason !== nothing
+        st.completed = true
+        st.stop_reason = stop_reason
+        _persist_stream_state!(cfg, st)
+    end
+    return (result = result, stop_reason = stop_reason)
+end
+
+function _process_stream_chunk!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    io::IO,
+    pending_line::IOBuffer,
+    chunk,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+)
+    for b in chunk
+        if b == UInt8('\n')
+            line = String(take!(pending_line))
+            res = _record_stream_line!(cfg, st, sdb, io, line, started_at, activity_ref)
+            res.stop_reason !== nothing && return res
+        else
+            write(pending_line, b)
+        end
+    end
+    return (result = :pending, stop_reason = nothing)
+end
+
+function _flush_pending_stream_line!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    io::IO,
+    pending_line::IOBuffer,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+)
+    position(pending_line) == 0 && return (result = :empty, stop_reason = nothing)
+    line = String(take!(pending_line))
+    return _record_stream_line!(cfg, st, sdb, io, line, started_at, activity_ref)
+end
+
+function _read_stream_lines!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    io::IO,
+    http,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+)
+    pending_line = IOBuffer()
+    try
+        while true
+            chunk = readavailable(http)
+            res = _process_stream_chunk!(
+                cfg,
+                st,
+                sdb,
+                io,
+                pending_line,
+                chunk,
+                started_at,
+                activity_ref,
+            )
+            if res.stop_reason !== nothing
+                return (
+                    kind = :completed,
+                    stop_reason = res.stop_reason,
+                    sleep_seconds = 0,
+                    activity = activity_ref[],
+                )
+            end
+        end
+    catch e
+        res = _flush_pending_stream_line!(
+            cfg,
+            st,
+            sdb,
+            io,
+            pending_line,
+            started_at,
+            activity_ref,
+        )
+        if res.stop_reason !== nothing
+            return (
+                kind = :completed,
+                stop_reason = res.stop_reason,
+                sleep_seconds = 0,
+                activity = activity_ref[],
+            )
+        end
+        rethrow(e)
+    end
+end
+
+function _stream_reconnect_decision(cfg::StreamConfig, reconnects::Int)
+    if !cfg.reconnect
+        return (should_reconnect = false, reconnects = reconnects, stop_reason = "")
+    end
+    next_reconnects = reconnects + 1
+    if next_reconnects > cfg.max_reconnects
+        return (
+            should_reconnect = false,
+            reconnects = next_reconnects,
+            stop_reason = "max_reconnects_exceeded",
+        )
+    end
+    return (should_reconnect = true, reconnects = next_reconnects, stop_reason = "")
+end
+
+function _looks_like_stream_timeout(e)::Bool
+    msg = sprint(showerror, e)
+    return occursin("Timeout", msg) || occursin("timed out", lowercase(msg))
+end
+
+function run_stream_collector(cfg::StreamConfig)
+    validate!(cfg)
+    mkpath(cfg.out_dir)
+
+    headers = bearer_headers(user_agent = "julia-x-collector/stream")
+    rule = ensure_stream_rule!(cfg, headers)
+    query = build_query(cfg)
+
+    st = load_stream_state(out_stream_state(cfg))
+    if st === nothing || st.query != query || st.rule_tag != cfg.rule_tag
+        st = StreamState()
+        st.task_name = cfg.task_name
+        st.query = query
+        st.rule_tag = cfg.rule_tag
+    end
+    st.rule_id = rule.id
+    st.completed = false
+    st.stop_reason = ""
+    _persist_stream_state!(cfg, st)
+
+    params = build_stream_params(cfg)
+    url = stream_url(cfg)
+    sdb = init_seen_db(cfg)
+    started_at = time()
+    reconnects = 0
+    delay = cfg.reconnect_initial_delay_seconds
+
+    try
+        open(out_jsonl(cfg), "a") do io
+            while true
+                stop_reason = _stream_stop_reason(cfg, st, started_at)
+                if stop_reason !== nothing
+                    st.completed = true
+                    st.stop_reason = stop_reason
+                    _persist_stream_state!(cfg, st)
+                    break
+                end
+
+                st.connection_count += 1
+                _persist_stream_state!(cfg, st)
+                @info "Connect stream" connection = st.connection_count tweets =
+                    st.total_tweets
+
+                activity_this_connection = Ref(false)
+                try
+                    outcome = HTTP.open(
+                        :GET,
+                        url,
+                        headers;
+                        query = params,
+                        status_exception = false,
+                        readtimeout = cfg.idle_timeout_seconds,
+                    ) do http
+                        resp = HTTP.startread(http)
+                        if resp.status != 200
+                            body =
+                                resp.status == 429 || 500 <= resp.status < 600 ? "" :
+                                _stream_response_body(http)
+                            status_outcome =
+                                _stream_response_outcome(resp, url; body = body)
+                            if status_outcome.stop_reason == "rate_limited"
+                                @warn "Stream rate limited" sleep_seconds =
+                                    status_outcome.sleep_seconds
+                            elseif status_outcome.stop_reason == "server_error"
+                                @warn "Stream server error" status = resp.status
+                            end
+                            return status_outcome
+                        end
+
+                        return _read_stream_lines!(
+                            cfg,
+                            st,
+                            sdb,
+                            io,
+                            http,
+                            started_at,
+                            activity_this_connection,
+                        )
+                    end
+
+                    if st.completed
+                        break
+                    end
+
+                    if activity_this_connection[]
+                        reconnects = 0
+                        delay = cfg.reconnect_initial_delay_seconds
+                    end
+
+                    if outcome.stop_reason in ("rate_limited", "server_error")
+                        st.stop_reason = outcome.stop_reason
+                        _persist_stream_state!(cfg, st)
+                    end
+
+                    decision = _stream_reconnect_decision(cfg, reconnects)
+                    reconnects = decision.reconnects
+                    if !decision.should_reconnect
+                        if !isempty(decision.stop_reason)
+                            st.stop_reason = decision.stop_reason
+                            _persist_stream_state!(cfg, st)
+                        end
+                        break
+                    end
+                    sleep_seconds =
+                        outcome.sleep_seconds > 0 ? outcome.sleep_seconds :
+                        delay + rand() * 0.5
+                    sleep(sleep_seconds)
+                    delay = min(delay * 1.8, cfg.reconnect_max_delay_seconds)
+
+                catch e
+                    if e isa InterruptException
+                        st.stop_reason = "interrupted"
+                        _persist_stream_state!(cfg, st)
+                        rethrow()
+                    elseif e isa XApiAccessError
+                        st.stop_reason = "api_error"
+                        _persist_stream_state!(cfg, st)
+                        rethrow()
+                    end
+
+                    stop_reason = _stream_stop_reason(cfg, st, started_at)
+                    if stop_reason !== nothing
+                        st.completed = true
+                        st.stop_reason = stop_reason
+                        _persist_stream_state!(cfg, st)
+                        break
+                    end
+
+                    if activity_this_connection[]
+                        reconnects = 0
+                        delay = cfg.reconnect_initial_delay_seconds
+                    end
+
+                    if _looks_like_stream_timeout(e) && !cfg.reconnect
+                        st.completed = true
+                        st.stop_reason = "idle_timeout"
+                        _persist_stream_state!(cfg, st)
+                        break
+                    end
+
+                    @warn "Stream connection failed" exception = e reconnects = reconnects
+                    decision = _stream_reconnect_decision(cfg, reconnects)
+                    reconnects = decision.reconnects
+                    if !decision.should_reconnect
+                        st.stop_reason =
+                            isempty(decision.stop_reason) ? "stream_error" :
+                            decision.stop_reason
+                        _persist_stream_state!(cfg, st)
+                        rethrow()
+                    end
+                    sleep(delay + rand() * 0.5)
+                    delay = min(delay * 1.8, cfg.reconnect_max_delay_seconds)
+                end
+            end
+        end
+
+        if !st.completed && isempty(st.stop_reason)
+            st.stop_reason = "disconnected"
+            _persist_stream_state!(cfg, st)
+        end
+        return st
+    finally
+        try
+            DBInterface.close!(sdb.db)
+        catch
+        end
+    end
+end
+
+# =========================================================
 # 収集本体
 # =========================================================
 build_search_params(
@@ -941,7 +1801,7 @@ function run_collector(cfg::SearchConfig)
     final_query = build_query(cfg)
 
     endpoint = choose_endpoint(cfg)
-    url = endpoint_url(endpoint)
+    url = endpoint_url(cfg, endpoint)
 
     tw = resolve_time_window(cfg, st, final_query; endpoint = endpoint)
     start_utc, end_utc = tw.start_utc, tw.end_utc
@@ -1386,6 +2246,8 @@ function convert_outputs(cfg::SearchConfig)
     return (converted_offset = new_offset, converted_at = st.converted_at)
 end
 
+convert_outputs(cfg::StreamConfig) = convert_outputs(as_search_config(cfg))
+
 # =========================================================
 # Wide変換（includes: users/media/places/tweets の結合）
 #   - ページマーカー "kind=page" で flush する（メモリ安定）
@@ -1395,6 +2257,10 @@ out_state_wide(cfg::SearchConfig) =
     joinpath(cfg.out_dir, "$(cfg.task_name).wide.state.json")
 out_csv_wide(cfg::SearchConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).wide.csv")
 out_arrow_wide(cfg::SearchConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).wide.arrow")
+out_state_wide(cfg::StreamConfig) =
+    joinpath(cfg.out_dir, "$(cfg.task_name).wide.state.json")
+out_csv_wide(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).wide.csv")
+out_arrow_wide(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).wide.arrow")
 
 wide_maybe_str(x) = begin
     s = safe_str(x; default = "")
@@ -1903,5 +2769,8 @@ function convert_outputs_wide(cfg::SearchConfig; sep::AbstractString = ";")
         new_offset csv_path = csv_path arrow_path = arrow_path
     return (converted_offset = new_offset, csv_path = csv_path, arrow_path = arrow_path)
 end
+
+convert_outputs_wide(cfg::StreamConfig; sep::AbstractString = ";") =
+    convert_outputs_wide(as_search_config(cfg); sep = sep)
 
 end # module
