@@ -493,6 +493,33 @@ is_json3_null(x) =
 
 isnull(x) = (x === nothing) || ismissing(x) || is_json3_null(x)
 
+_json_haskey(::Any, ::AbstractString) = false
+_json_haskey(obj::JSON3.Object, key::AbstractString) = haskey(obj, key)
+_json_haskey(obj::AbstractDict, key::AbstractString) = haskey(obj, key)
+
+_json_get(::Any, ::AbstractString, default = nothing) = default
+_json_get(obj::JSON3.Object, key::AbstractString, default = nothing) = get(obj, key, default)
+_json_get(obj::AbstractDict, key::AbstractString, default = nothing) = get(obj, key, default)
+
+_json_items(::Any) = Any[]
+_json_items(xs::AbstractVector) = xs
+
+_json_pairs(::Any) = Pair{String,Any}[]
+function _json_pairs(obj::JSON3.Object)
+    out = Pair{String,Any}[]
+    for (k, v) in obj
+        push!(out, String(k) => v)
+    end
+    return out
+end
+function _json_pairs(obj::AbstractDict)
+    out = Pair{String,Any}[]
+    for (k, v) in obj
+        push!(out, String(k) => v)
+    end
+    return out
+end
+
 # =========================================================
 # 小物（型変換 / atomic）
 # =========================================================
@@ -677,16 +704,18 @@ function resolve_time_window(
 
     # high-water
     if start_utc === nothing && cfg.use_state_highwater_start && st !== nothing
-        if st.completed && st.query == final_query && st.end_time_utc !== nothing
-            prev_end_dt = parse_utc_z(st.end_time_utc)
+        prev_end_utc = st.end_time_utc
+        if st.completed && st.query == final_query && prev_end_utc !== nothing
+            prev_end_dt = parse_utc_z(prev_end_utc)
             start_dt = prev_end_dt - Second(max(cfg.highwater_overlap_seconds, 0))
             start_dt < end_dt && (start_utc = dt_to_utc_z(start_dt))
         end
     end
 
     # window fallback
-    if start_utc === nothing && cfg.window_hours !== nothing
-        start_utc = dt_to_utc_z(end_dt - Hour(cfg.window_hours))
+    window_hours = cfg.window_hours
+    if start_utc === nothing && window_hours !== nothing
+        start_utc = dt_to_utc_z(end_dt - Hour(window_hours))
     end
 
     # recent のみ start を 7日内にクリップ
@@ -773,7 +802,7 @@ end
 
 function _reset_stmt!(stmt)
     stmt === nothing && return
-    if isdefined(SQLite, :reset!)
+    if isdefined(SQLite, :reset!) && hasmethod(SQLite.reset!, Tuple{typeof(stmt)})
         try
             SQLite.reset!(stmt)
         catch
@@ -897,17 +926,17 @@ function _extract_x_api_error_detail(body::AbstractString)::String
         obj = JSON3.read(txt)
         parts = String[]
 
-        if haskey(obj, "title")
-            push!(parts, safe_str(obj["title"]; default = ""))
+        if _json_haskey(obj, "title")
+            push!(parts, safe_str(_json_get(obj, "title", nothing); default = ""))
         end
-        if haskey(obj, "detail")
-            push!(parts, safe_str(obj["detail"]; default = ""))
+        if _json_haskey(obj, "detail")
+            push!(parts, safe_str(_json_get(obj, "detail", nothing); default = ""))
         end
-        if haskey(obj, "errors")
-            for err in obj["errors"]
-                ttl = safe_str(get(err, "title", nothing); default = "")
-                det = safe_str(get(err, "detail", nothing); default = "")
-                status = safe_str(get(err, "status", nothing); default = "")
+        if _json_haskey(obj, "errors")
+            for err in _json_items(_json_get(obj, "errors", nothing))
+                ttl = safe_str(_json_get(err, "title", nothing); default = "")
+                det = safe_str(_json_get(err, "detail", nothing); default = "")
+                status = safe_str(_json_get(err, "status", nothing); default = "")
                 piece = join(filter(!isempty, [ttl, det, status]), " / ")
                 !isempty(piece) && push!(parts, piece)
             end
@@ -1000,12 +1029,12 @@ Base.@kwdef struct UsageSummary
 end
 
 function parse_usage_summary(obj)::UsageSummary
-    data = get(obj, "data", nothing)
+    data = _json_get(obj, "data", nothing)
     data === nothing && return UsageSummary()
 
-    cap = safe_int(get(data, "project_cap", nothing))
-    usage = safe_int(get(data, "project_usage", nothing))
-    reset_day = safe_int(get(data, "cap_reset_day", nothing))
+    cap = safe_int(_json_get(data, "project_cap", nothing))
+    usage = safe_int(_json_get(data, "project_usage", nothing))
+    reset_day = safe_int(_json_get(data, "cap_reset_day", nothing))
     remaining = (ismissing(cap) || ismissing(usage)) ? missing : max(cap - usage, 0)
 
     return UsageSummary(
@@ -1360,35 +1389,36 @@ function add_stream_rule!(
 end
 
 function _rules_data(obj)
-    data = get(obj, "data", nothing)
+    data = _json_get(obj, "data", nothing)
     data === nothing && return Any[]
-    return data
+    return _json_items(data)
 end
 
 function _rule_namedtuple(rule)
     return (
-        id = safe_str(get(rule, "id", nothing); default = ""),
-        value = safe_str(get(rule, "value", nothing); default = ""),
-        tag = safe_str(get(rule, "tag", nothing); default = ""),
+        id = safe_str(_json_get(rule, "id", nothing); default = ""),
+        value = safe_str(_json_get(rule, "value", nothing); default = ""),
+        tag = safe_str(_json_get(rule, "tag", nothing); default = ""),
     )
 end
 
 function _stream_rules_summary(obj)
-    meta = get(obj, "meta", nothing)
+    meta = _json_get(obj, "meta", nothing)
     meta === nothing && return nothing
-    return get(meta, "summary", nothing)
+    return _json_get(meta, "summary", nothing)
 end
 
 function _stream_rules_summary_count(obj, key::AbstractString)::Int
     summary = _stream_rules_summary(obj)
     summary === nothing && return 0
-    return safe_int(get(summary, key, nothing); default = 0)
+    return safe_int(_json_get(summary, key, nothing); default = 0)
 end
 
 function _stream_rules_error_detail(obj)::String
     parts = String[]
-    if haskey(obj, "errors")
-        push!(parts, "errors=$(String(JSON3.write(obj["errors"])))")
+    if _json_haskey(obj, "errors")
+        errors = _json_get(obj, "errors", nothing)
+        push!(parts, "errors=$(String(JSON3.write(errors)))")
     end
     summary = _stream_rules_summary(obj)
     if summary !== nothing
@@ -1398,7 +1428,7 @@ function _stream_rules_error_detail(obj)::String
 end
 
 function _assert_stream_rules_response_ok(obj; action::Symbol)
-    if haskey(obj, "errors")
+    if _json_haskey(obj, "errors")
         error("Stream rules API $(action) failed: $(_stream_rules_error_detail(obj))")
     end
     if action === :add
@@ -1464,7 +1494,7 @@ function ensure_stream_rule!(cfg::StreamConfig, headers, fetch_json::Function)
     end
 
     rules = list_stream_rules(cfg, headers, fetch_json)
-    same_tag = [_rule_namedtuple(r) for r in _rules_data(rules) if safe_str(get(r, "tag", nothing); default = "") == tag]
+    same_tag = [_rule_namedtuple(r) for r in _rules_data(rules) if safe_str(_json_get(r, "tag", nothing); default = "") == tag]
     for r in same_tag
         if r.value == value
             rid = isempty(r.id) ? nothing : r.id
@@ -1510,14 +1540,15 @@ end
 
 function _stream_event_meta(obj, received_at::AbstractString, page_new::Int)
     meta = Dict{String,Any}("received_at" => String(received_at), "result_count" => page_new)
-    haskey(obj, "matching_rules") && (meta["matching_rules"] = obj["matching_rules"])
-    haskey(obj, "errors") && (meta["errors"] = obj["errors"])
-    haskey(obj, "meta") && (meta["stream_meta"] = obj["meta"])
+    _json_haskey(obj, "matching_rules") &&
+        (meta["matching_rules"] = _json_get(obj, "matching_rules", nothing))
+    _json_haskey(obj, "errors") && (meta["errors"] = _json_get(obj, "errors", nothing))
+    _json_haskey(obj, "meta") && (meta["stream_meta"] = _json_get(obj, "meta", nothing))
     return meta
 end
 
 function _stream_data_items(obj)
-    data = get(obj, "data", nothing)
+    data = _json_get(obj, "data", nothing)
     data === nothing && return Any[]
     if data isa AbstractVector
         return data
@@ -1548,10 +1579,10 @@ function handle_stream_line!(
 
     new_tweets = Any[]
     new_ids = String[]
-    if haskey(obj, "data")
+    if _json_haskey(obj, "data")
         seen_in_event = Set{String}()
         for tw in _stream_data_items(obj)
-            tid = safe_str(get(tw, "id", nothing); default = "")
+            tid = safe_str(_json_get(tw, "id", nothing); default = "")
             isempty(tid) && continue
             tid in seen_in_event && continue
             push!(seen_in_event, tid)
@@ -1578,7 +1609,7 @@ function handle_stream_line!(
             page_new = length(accepted_tweets)
             if page_new == 0
                 DBInterface.execute(sdb.db, "COMMIT;")
-                return haskey(obj, "errors") ? :errors : :ignored
+                return _json_haskey(obj, "errors") ? :errors : :ignored
             end
 
             entries = Vector{Tuple{String,Any}}()
@@ -1587,11 +1618,11 @@ function handle_stream_line!(
             end
 
             include_count = 0
-            if cfg.write_includes && haskey(obj, "includes")
-                inc = obj["includes"]
-                for (k, arr) in inc
+            if cfg.write_includes && _json_haskey(obj, "includes")
+                inc = _json_get(obj, "includes", nothing)
+                for (k, arr) in _json_pairs(inc)
                     kstr = String(k)
-                    for item in arr
+                    for item in _json_items(arr)
                         push!(entries, ("include:$kstr", item))
                         include_count += 1
                     end
@@ -1627,7 +1658,7 @@ function handle_stream_line!(
         return :tweet
     end
 
-    return haskey(obj, "errors") ? :errors : :ignored
+    return _json_haskey(obj, "errors") ? :errors : :ignored
 end
 
 function _stream_stop_reason(cfg::StreamConfig, st::StreamState, started_at::Float64)
@@ -2434,12 +2465,12 @@ function run_collector(cfg::SearchConfig)
                 end
 
                 page_new = 0
-                if haskey(res, "data")
+                if _json_haskey(res, "data")
                     DBInterface.execute(sdb.db, "BEGIN;")
                     try
                         seen_at = utc_now_z(lag_seconds = 0)
-                        for tw in res["data"]
-                            tid = safe_str(get(tw, "id", nothing); default = "")
+                        for tw in _json_items(_json_get(res, "data", nothing))
+                            tid = safe_str(_json_get(tw, "id", nothing); default = "")
                             isempty(tid) && continue
                             if mark_seen!(sdb, tid, seen_at)
                                 write_jsonl(io, "tweet", tw)
@@ -2457,18 +2488,18 @@ function run_collector(cfg::SearchConfig)
                     end
                 end
 
-                if cfg.write_includes && page_new > 0 && haskey(res, "includes")
-                    inc = res["includes"]
-                    for (k, arr) in inc
+                if cfg.write_includes && page_new > 0 && _json_haskey(res, "includes")
+                    inc = _json_get(res, "includes", nothing)
+                    for (k, arr) in _json_pairs(inc)
                         kstr = String(k)
-                        for obj in arr
+                        for obj in _json_items(arr)
                             write_jsonl(io, "include:$kstr", obj)
                             st2.total_includes += 1
                         end
                     end
                 end
 
-                meta = get(res, "meta", nothing)
+                meta = _json_get(res, "meta", nothing)
                 write_jsonl(
                     io,
                     "page",
@@ -2480,12 +2511,8 @@ function run_collector(cfg::SearchConfig)
                 )
                 flush(io)
 
-                next_token =
-                    meta === nothing ? nothing :
-                    (
-                        isnull(get(meta, "next_token", nothing)) ? nothing :
-                        String(get(meta, "next_token", nothing))
-                    )
+                next_raw = _json_get(meta, "next_token", nothing)
+                next_token = isnull(next_raw) ? nothing : safe_str(next_raw; default = "")
 
                 st2.next_token = next_token
                 st2.completed = (next_token === nothing)
@@ -2573,23 +2600,23 @@ const TweetRow = NamedTuple{
 }
 
 function tweet_to_row(tw)::TweetRow
-    pm = get(tw, "public_metrics", nothing)
+    pm = _json_get(tw, "public_metrics", nothing)
     return (
-        id = safe_str(get(tw, "id", nothing); default = ""),
-        created_at = safe_str(get(tw, "created_at", nothing); default = ""),
-        author_id = safe_str(get(tw, "author_id", nothing); default = ""),
-        lang = safe_str(get(tw, "lang", nothing); default = ""),
-        possibly_sensitive = safe_bool(get(tw, "possibly_sensitive", nothing)),
-        like_count = pm === nothing ? missing : safe_int(get(pm, "like_count", nothing)),
+        id = safe_str(_json_get(tw, "id", nothing); default = ""),
+        created_at = safe_str(_json_get(tw, "created_at", nothing); default = ""),
+        author_id = safe_str(_json_get(tw, "author_id", nothing); default = ""),
+        lang = safe_str(_json_get(tw, "lang", nothing); default = ""),
+        possibly_sensitive = safe_bool(_json_get(tw, "possibly_sensitive", nothing)),
+        like_count = pm === nothing ? missing : safe_int(_json_get(pm, "like_count", nothing)),
         retweet_count = pm === nothing ? missing :
-                        safe_int(get(pm, "retweet_count", nothing)),
-        reply_count = pm === nothing ? missing : safe_int(get(pm, "reply_count", nothing)),
-        quote_count = pm === nothing ? missing : safe_int(get(pm, "quote_count", nothing)),
+                        safe_int(_json_get(pm, "retweet_count", nothing)),
+        reply_count = pm === nothing ? missing : safe_int(_json_get(pm, "reply_count", nothing)),
+        quote_count = pm === nothing ? missing : safe_int(_json_get(pm, "quote_count", nothing)),
         bookmark_count = pm === nothing ? missing :
-                         safe_int(get(pm, "bookmark_count", nothing)),
+                         safe_int(_json_get(pm, "bookmark_count", nothing)),
         impression_count = pm === nothing ? missing :
-                           safe_int(get(pm, "impression_count", nothing)),
-        text = safe_str(get(tw, "text", nothing); default = ""),
+                           safe_int(_json_get(pm, "impression_count", nothing)),
+        text = safe_str(_json_get(tw, "text", nothing); default = ""),
     )
 end
 
@@ -2787,9 +2814,10 @@ function _convert_outputs_from_jsonl_paths(
 
                 try
                     obj = JSON3.read(s)
-                    kind = safe_str(get(obj, "kind", nothing); default = "")
+                    kind = safe_str(_json_get(obj, "kind", nothing); default = "")
                     if kind == "tweet"
-                        push!(batch, tweet_to_row(obj["data"]))
+                        data = _json_get(obj, "data", nothing)
+                        data === nothing || push!(batch, tweet_to_row(data))
 
                         if length(batch) >= cfg.convert_batch_size
                             cfg.emit_csv && write_csv_batch!(cfg, batch)
@@ -2885,7 +2913,7 @@ wide_json_str(x) = begin
         missing
     end
 end
-wide_getv(obj, key, default = nothing) = haskey(obj, key) ? obj[key] : default
+wide_getv(obj, key, default = nothing) = _json_get(obj, String(key), default)
 
 function wide_author_cols(author_id::AbstractString, users::Dict{String,Any})
     u = get(users, author_id, nothing)
@@ -3330,7 +3358,7 @@ function _convert_outputs_wide_from_jsonl_paths(
 
                 try
                     obj = JSON3.read(s)
-                    kind = safe_str(get(obj, "kind", nothing); default = "")
+                    kind = safe_str(_json_get(obj, "kind", nothing); default = "")
 
                     if kind == "tweet"
                         # page 無しで tweet が延々続く場合のOOM回避
@@ -3341,12 +3369,13 @@ function _convert_outputs_wide_from_jsonl_paths(
                         if last_kind in (:include, :page) && !isempty(pending_tweets)
                             flush_pending!()
                         end
-                        push!(pending_tweets, obj["data"])
+                        data = _json_get(obj, "data", nothing)
+                        data === nothing || push!(pending_tweets, data)
                         last_kind = :tweet
 
                     elseif startswith(kind, "include:")
                         suf = replace(kind, "include:" => "")
-                        d = obj["data"]
+                        d = _json_get(obj, "data", nothing)
                         if suf == "users"
                             uid = safe_str(wide_getv(d, "id", nothing); default = "")
                             !isempty(uid) && (users_cache[uid] = d)

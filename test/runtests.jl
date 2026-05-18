@@ -51,6 +51,8 @@ using Tables
 using Logging
 using Random
 using DBInterface
+using Aqua
+using JET
 
 # ---------------------------------------------------------
 # Helpers
@@ -252,6 +254,14 @@ Base.write(::FailingIO, ::AbstractVector{UInt8}) = error("write failed")
 Base.write(::FailingIO, ::AbstractString) = error("write failed")
 Base.write(::FailingIO, ::Char) = error("write failed")
 Base.flush(::FailingIO) = nothing
+
+@testset "Aqua.jl" begin
+    Aqua.test_all(XPostCollector)
+end
+
+@testset "JET.jl" begin
+    JET.test_package(XPostCollector; target_modules = (XPostCollector,), toplevel_logger = nothing)
+end
 
 # ---------------------------------------------------------
 # validate!
