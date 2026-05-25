@@ -229,11 +229,15 @@ Base.@kwdef mutable struct StreamConfig
     idle_timeout_seconds::Int = 30
 
     reconnect::Bool = true
-    max_reconnects::Int = 10
+    max_reconnects::Int = 0
     reconnect_initial_delay_seconds::Float64 = 5.0
     reconnect_max_delay_seconds::Float64 = 60.0
 
     write_includes::Bool = true
+    durable_writes::Bool = false
+    rotate_jsonl_bytes::Int = 0
+    rotate_jsonl_seconds::Float64 = 0.0
+    state_flush_interval_seconds::Float64 = 30.0
 
     out_dir::String = "."
     log_dir::String = "logs"
@@ -261,6 +265,7 @@ out_log(cfg::SearchConfig) = joinpath(cfg.log_dir, "$(cfg.task_name).log")
 
 out_jsonl(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).jsonl")
 out_stream_state(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).stream.state.json")
+out_stream_gaps(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).stream.gaps.jsonl")
 out_csv(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).csv")
 out_arrow(cfg::StreamConfig) =
     isempty(cfg.arrow_path) ? joinpath(cfg.out_dir, "$(cfg.task_name).arrow") :
@@ -336,6 +341,9 @@ function validate!(cfg::StreamConfig)
         max(cfg.reconnect_initial_delay_seconds, 0.1)
     cfg.reconnect_max_delay_seconds =
         max(cfg.reconnect_max_delay_seconds, cfg.reconnect_initial_delay_seconds)
+    cfg.rotate_jsonl_bytes = max(cfg.rotate_jsonl_bytes, 0)
+    cfg.rotate_jsonl_seconds = max(cfg.rotate_jsonl_seconds, 0.0)
+    cfg.state_flush_interval_seconds = max(cfg.state_flush_interval_seconds, 0.0)
     cfg.convert_batch_size = max(cfg.convert_batch_size, 1)
 
     return cfg
@@ -373,12 +381,22 @@ mutable struct StreamState
     total_tweets::Int
     total_includes::Int
     keepalive_count::Int
+    last_heartbeat_at::String
     last_event_at::String
+    last_error::String
+    last_status::Int
+    consecutive_failures::Int
+    last_connected_at::String
+    last_disconnect_at::String
+    seen_count::Int
+    db_path::String
+    db_size_bytes::Int
     completed::Bool
     stop_reason::String
 end
 
-StreamState() = StreamState("", "", "", nothing, "", 0, 0, 0, 0, "", false, "")
+StreamState() =
+    StreamState("", "", "", nothing, "", 0, 0, 0, 0, "", "", "", 0, 0, "", "", 0, "", 0, false, "")
 StructTypes.StructType(::Type{StreamState}) = StructTypes.Mutable()
 
 # =========================================================
@@ -474,6 +492,33 @@ is_json3_null(x) =
     (_JSON3_NULL_TYPE !== Nothing && x isa _JSON3_NULL_TYPE)
 
 isnull(x) = (x === nothing) || ismissing(x) || is_json3_null(x)
+
+_json_haskey(::Any, ::AbstractString) = false
+_json_haskey(obj::JSON3.Object, key::AbstractString) = haskey(obj, key)
+_json_haskey(obj::AbstractDict, key::AbstractString) = haskey(obj, key)
+
+_json_get(::Any, ::AbstractString, default = nothing) = default
+_json_get(obj::JSON3.Object, key::AbstractString, default = nothing) = get(obj, key, default)
+_json_get(obj::AbstractDict, key::AbstractString, default = nothing) = get(obj, key, default)
+
+_json_items(::Any) = Any[]
+_json_items(xs::AbstractVector) = xs
+
+_json_pairs(::Any) = Pair{String,Any}[]
+function _json_pairs(obj::JSON3.Object)
+    out = Pair{String,Any}[]
+    for (k, v) in obj
+        push!(out, String(k) => v)
+    end
+    return out
+end
+function _json_pairs(obj::AbstractDict)
+    out = Pair{String,Any}[]
+    for (k, v) in obj
+        push!(out, String(k) => v)
+    end
+    return out
+end
 
 # =========================================================
 # 小物（型変換 / atomic）
@@ -659,16 +704,18 @@ function resolve_time_window(
 
     # high-water
     if start_utc === nothing && cfg.use_state_highwater_start && st !== nothing
-        if st.completed && st.query == final_query && st.end_time_utc !== nothing
-            prev_end_dt = parse_utc_z(st.end_time_utc)
+        prev_end_utc = st.end_time_utc
+        if st.completed && st.query == final_query && prev_end_utc !== nothing
+            prev_end_dt = parse_utc_z(prev_end_utc)
             start_dt = prev_end_dt - Second(max(cfg.highwater_overlap_seconds, 0))
             start_dt < end_dt && (start_utc = dt_to_utc_z(start_dt))
         end
     end
 
     # window fallback
-    if start_utc === nothing && cfg.window_hours !== nothing
-        start_utc = dt_to_utc_z(end_dt - Hour(cfg.window_hours))
+    window_hours = cfg.window_hours
+    if start_utc === nothing && window_hours !== nothing
+        start_utc = dt_to_utc_z(end_dt - Hour(window_hours))
     end
 
     # recent のみ start を 7日内にクリップ
@@ -755,7 +802,7 @@ end
 
 function _reset_stmt!(stmt)
     stmt === nothing && return
-    if isdefined(SQLite, :reset!)
+    if isdefined(SQLite, :reset!) && hasmethod(SQLite.reset!, Tuple{typeof(stmt)})
         try
             SQLite.reset!(stmt)
         catch
@@ -789,6 +836,26 @@ function mark_seen!(sdb::SeenDB, id::String, seen_at_utc::String)::Bool
     end
     _reset_stmt!(sdb.stmt_changes)
     return c == 1
+end
+
+function seen_exists(sdb::SeenDB, id::String)::Bool
+    q = DBInterface.execute(
+        sdb.db,
+        "SELECT 1 AS seen FROM seen_tweets WHERE id = ? LIMIT 1;",
+        (id,),
+    )
+    for _ in q
+        return true
+    end
+    return false
+end
+
+function count_seen(sdb::SeenDB)::Int
+    q = DBInterface.execute(sdb.db, "SELECT COUNT(*) AS c FROM seen_tweets;")
+    for row in q
+        return Int(hasproperty(row, :c) ? row.c : first(values(row)))
+    end
+    return 0
 end
 
 # =========================================================
@@ -859,17 +926,17 @@ function _extract_x_api_error_detail(body::AbstractString)::String
         obj = JSON3.read(txt)
         parts = String[]
 
-        if haskey(obj, "title")
-            push!(parts, safe_str(obj["title"]; default = ""))
+        if _json_haskey(obj, "title")
+            push!(parts, safe_str(_json_get(obj, "title", nothing); default = ""))
         end
-        if haskey(obj, "detail")
-            push!(parts, safe_str(obj["detail"]; default = ""))
+        if _json_haskey(obj, "detail")
+            push!(parts, safe_str(_json_get(obj, "detail", nothing); default = ""))
         end
-        if haskey(obj, "errors")
-            for err in obj["errors"]
-                ttl = safe_str(get(err, "title", nothing); default = "")
-                det = safe_str(get(err, "detail", nothing); default = "")
-                status = safe_str(get(err, "status", nothing); default = "")
+        if _json_haskey(obj, "errors")
+            for err in _json_items(_json_get(obj, "errors", nothing))
+                ttl = safe_str(_json_get(err, "title", nothing); default = "")
+                det = safe_str(_json_get(err, "detail", nothing); default = "")
+                status = safe_str(_json_get(err, "status", nothing); default = "")
                 piece = join(filter(!isempty, [ttl, det, status]), " / ")
                 !isempty(piece) && push!(parts, piece)
             end
@@ -962,12 +1029,12 @@ Base.@kwdef struct UsageSummary
 end
 
 function parse_usage_summary(obj)::UsageSummary
-    data = get(obj, "data", nothing)
+    data = _json_get(obj, "data", nothing)
     data === nothing && return UsageSummary()
 
-    cap = safe_int(get(data, "project_cap", nothing))
-    usage = safe_int(get(data, "project_usage", nothing))
-    reset_day = safe_int(get(data, "cap_reset_day", nothing))
+    cap = safe_int(_json_get(data, "project_cap", nothing))
+    usage = safe_int(_json_get(data, "project_usage", nothing))
+    reset_day = safe_int(_json_get(data, "cap_reset_day", nothing))
     remaining = (ismissing(cap) || ismissing(usage)) ? missing : max(cap - usage, 0)
 
     return UsageSummary(
@@ -1060,6 +1127,138 @@ end
 # =========================================================
 write_jsonl(io::IO, kind::AbstractString, data) =
     (JSON3.write(io, (; kind = kind, data = data)); write(io, '\n'))
+
+mutable struct StreamJsonlWriter
+    io::IO
+    opened_at::Float64
+    rotation_count::Int
+end
+
+_stream_sink_io(io::IO) = io
+_stream_sink_io(w::StreamJsonlWriter) = w.io
+
+function _maybe_fsync(io::IO)
+    try
+        Base.Libc.fsync(fd(io))
+    catch e
+        @debug "fsync skipped" exception = e
+    end
+    return nothing
+end
+
+function _flush_stream_sink!(cfg::StreamConfig, sink)
+    io = _stream_sink_io(sink)
+    flush(io)
+    cfg.durable_writes && _maybe_fsync(io)
+    return nothing
+end
+
+function _rotated_jsonl_path(cfg::StreamConfig, rotation_count::Int)
+    stamp = Dates.format(Dates.now(Dates.UTC), dateformat"yyyymmdd\THHMMSS")
+    idx = rotation_count
+    while true
+        path = joinpath(cfg.out_dir, "$(cfg.task_name).rot-$stamp-$(lpad(string(idx), 6, '0')).jsonl")
+        isfile(path) || return path
+        idx += 1
+    end
+end
+
+function _open_stream_jsonl_writer(cfg::StreamConfig)
+    return StreamJsonlWriter(open(out_jsonl(cfg), "a"), time(), 0)
+end
+
+function _close_stream_jsonl_writer!(w::StreamJsonlWriter)
+    close(w.io)
+    return nothing
+end
+
+function _reopen_stream_jsonl_writer!(cfg::StreamConfig, sink::StreamJsonlWriter; open_file = open)
+    sink.io = open_file(out_jsonl(cfg), "a")
+    sink.opened_at = time()
+    return nothing
+end
+
+function _rotate_stream_jsonl_if_needed!(
+    cfg::StreamConfig,
+    sink;
+    move_file = mv,
+    open_file = open,
+)
+    sink isa StreamJsonlWriter || return nothing
+    size_limit = cfg.rotate_jsonl_bytes > 0
+    age_limit = cfg.rotate_jsonl_seconds > 0
+    (size_limit || age_limit) || return nothing
+
+    path = out_jsonl(cfg)
+    current_size = isfile(path) ? stat(path).size : 0
+    should_rotate =
+        (size_limit && current_size >= cfg.rotate_jsonl_bytes) ||
+        (age_limit && (time() - sink.opened_at) >= cfg.rotate_jsonl_seconds)
+    should_rotate || return nothing
+    current_size <= 0 && return nothing
+
+    _flush_stream_sink!(cfg, sink)
+    close(sink.io)
+    sink.rotation_count += 1
+    rotated = _rotated_jsonl_path(cfg, sink.rotation_count)
+    try
+        move_file(path, rotated; force = false)
+        try
+            _reopen_stream_jsonl_writer!(cfg, sink; open_file = open_file)
+        catch e
+            try
+                isfile(rotated) && !isfile(path) && move_file(rotated, path; force = false)
+            catch restore_error
+                @warn "Failed to restore active stream JSONL after reopen failure" exception =
+                    restore_error
+            end
+            try
+                _reopen_stream_jsonl_writer!(cfg, sink)
+            catch reopen_error
+                @warn "Failed to reopen active stream JSONL after rotation failure" exception =
+                    reopen_error
+            end
+            rethrow(e)
+        end
+    catch e
+        try
+            _reopen_stream_jsonl_writer!(cfg, sink)
+        catch reopen_error
+            @warn "Failed to reopen active stream JSONL after rotation failure" exception =
+                reopen_error
+        end
+        rethrow(e)
+    end
+    @info "Rotated stream JSONL" old = path new = rotated
+    return rotated
+end
+
+function _write_stream_jsonl_entries!(cfg::StreamConfig, sink, entries)
+    isempty(entries) && return nothing
+    _rotate_stream_jsonl_if_needed!(cfg, sink)
+    io = _stream_sink_io(sink)
+    for (kind, data) in entries
+        write_jsonl(io, kind, data)
+    end
+    _flush_stream_sink!(cfg, sink)
+    return nothing
+end
+
+function stream_jsonl_paths(cfg::StreamConfig)
+    isdir(cfg.out_dir) || return String[]
+    rotated_prefix = "$(cfg.task_name).rot-"
+    paths = String[]
+    for name in readdir(cfg.out_dir)
+        startswith(name, rotated_prefix) || continue
+        endswith(name, ".jsonl") || continue
+        path = joinpath(cfg.out_dir, name)
+        isfile(path) && push!(paths, path)
+    end
+    sort!(paths)
+    active = out_jsonl(cfg)
+    isfile(active) && push!(paths, active)
+    return paths
+end
 
 # =========================================================
 # Filtered Stream
@@ -1190,35 +1389,36 @@ function add_stream_rule!(
 end
 
 function _rules_data(obj)
-    data = get(obj, "data", nothing)
+    data = _json_get(obj, "data", nothing)
     data === nothing && return Any[]
-    return data
+    return _json_items(data)
 end
 
 function _rule_namedtuple(rule)
     return (
-        id = safe_str(get(rule, "id", nothing); default = ""),
-        value = safe_str(get(rule, "value", nothing); default = ""),
-        tag = safe_str(get(rule, "tag", nothing); default = ""),
+        id = safe_str(_json_get(rule, "id", nothing); default = ""),
+        value = safe_str(_json_get(rule, "value", nothing); default = ""),
+        tag = safe_str(_json_get(rule, "tag", nothing); default = ""),
     )
 end
 
 function _stream_rules_summary(obj)
-    meta = get(obj, "meta", nothing)
+    meta = _json_get(obj, "meta", nothing)
     meta === nothing && return nothing
-    return get(meta, "summary", nothing)
+    return _json_get(meta, "summary", nothing)
 end
 
 function _stream_rules_summary_count(obj, key::AbstractString)::Int
     summary = _stream_rules_summary(obj)
     summary === nothing && return 0
-    return safe_int(get(summary, key, nothing); default = 0)
+    return safe_int(_json_get(summary, key, nothing); default = 0)
 end
 
 function _stream_rules_error_detail(obj)::String
     parts = String[]
-    if haskey(obj, "errors")
-        push!(parts, "errors=$(String(JSON3.write(obj["errors"])))")
+    if _json_haskey(obj, "errors")
+        errors = _json_get(obj, "errors", nothing)
+        push!(parts, "errors=$(String(JSON3.write(errors)))")
     end
     summary = _stream_rules_summary(obj)
     if summary !== nothing
@@ -1228,7 +1428,7 @@ function _stream_rules_error_detail(obj)::String
 end
 
 function _assert_stream_rules_response_ok(obj; action::Symbol)
-    if haskey(obj, "errors")
+    if _json_haskey(obj, "errors")
         error("Stream rules API $(action) failed: $(_stream_rules_error_detail(obj))")
     end
     if action === :add
@@ -1294,7 +1494,7 @@ function ensure_stream_rule!(cfg::StreamConfig, headers, fetch_json::Function)
     end
 
     rules = list_stream_rules(cfg, headers, fetch_json)
-    same_tag = [_rule_namedtuple(r) for r in _rules_data(rules) if safe_str(get(r, "tag", nothing); default = "") == tag]
+    same_tag = [_rule_namedtuple(r) for r in _rules_data(rules) if safe_str(_json_get(r, "tag", nothing); default = "") == tag]
     for r in same_tag
         if r.value == value
             rid = isempty(r.id) ? nothing : r.id
@@ -1340,14 +1540,15 @@ end
 
 function _stream_event_meta(obj, received_at::AbstractString, page_new::Int)
     meta = Dict{String,Any}("received_at" => String(received_at), "result_count" => page_new)
-    haskey(obj, "matching_rules") && (meta["matching_rules"] = obj["matching_rules"])
-    haskey(obj, "errors") && (meta["errors"] = obj["errors"])
-    haskey(obj, "meta") && (meta["stream_meta"] = obj["meta"])
+    _json_haskey(obj, "matching_rules") &&
+        (meta["matching_rules"] = _json_get(obj, "matching_rules", nothing))
+    _json_haskey(obj, "errors") && (meta["errors"] = _json_get(obj, "errors", nothing))
+    _json_haskey(obj, "meta") && (meta["stream_meta"] = _json_get(obj, "meta", nothing))
     return meta
 end
 
 function _stream_data_items(obj)
-    data = get(obj, "data", nothing)
+    data = _json_get(obj, "data", nothing)
     data === nothing && return Any[]
     if data isa AbstractVector
         return data
@@ -1359,12 +1560,13 @@ function handle_stream_line!(
     cfg::StreamConfig,
     st::StreamState,
     sdb::SeenDB,
-    io::IO,
+    sink,
     line::AbstractString,
 )::Symbol
     payload = _stream_line_payload(line)
     if payload === nothing
         st.keepalive_count += 1
+        st.last_heartbeat_at = stream_now_utc()
         return :keepalive
     end
 
@@ -1375,21 +1577,77 @@ function handle_stream_line!(
         return :invalid
     end
 
-    page_new = 0
-    if haskey(obj, "data")
+    new_tweets = Any[]
+    new_ids = String[]
+    if _json_haskey(obj, "data")
+        seen_in_event = Set{String}()
+        for tw in _stream_data_items(obj)
+            tid = safe_str(_json_get(tw, "id", nothing); default = "")
+            isempty(tid) && continue
+            tid in seen_in_event && continue
+            push!(seen_in_event, tid)
+            if !seen_exists(sdb, tid)
+                push!(new_tweets, tw)
+                push!(new_ids, tid)
+            end
+        end
+    end
+
+    if !isempty(new_tweets)
         DBInterface.execute(sdb.db, "BEGIN;")
         try
             seen_at = utc_now_z(lag_seconds = 0)
-            for tw in _stream_data_items(obj)
-                tid = safe_str(get(tw, "id", nothing); default = "")
-                isempty(tid) && continue
+            inserted = 0
+            accepted_tweets = Any[]
+            for (tw, tid) in zip(new_tweets, new_ids)
                 if mark_seen!(sdb, tid, seen_at)
-                    write_jsonl(io, "tweet", tw)
-                    st.total_tweets += 1
-                    page_new += 1
+                    push!(accepted_tweets, tw)
+                    inserted += 1
                 end
             end
+
+            page_new = length(accepted_tweets)
+            if page_new == 0
+                DBInterface.execute(sdb.db, "COMMIT;")
+                return _json_haskey(obj, "errors") ? :errors : :ignored
+            end
+
+            entries = Vector{Tuple{String,Any}}()
+            for tw in accepted_tweets
+                push!(entries, ("tweet", tw))
+            end
+
+            include_count = 0
+            if cfg.write_includes && _json_haskey(obj, "includes")
+                inc = _json_get(obj, "includes", nothing)
+                for (k, arr) in _json_pairs(inc)
+                    kstr = String(k)
+                    for item in _json_items(arr)
+                        push!(entries, ("include:$kstr", item))
+                        include_count += 1
+                    end
+                end
+            end
+
+            received_at = stream_now_utc()
+            push!(
+                entries,
+                (
+                    "page",
+                    Dict(
+                        "page" => st.total_tweets + page_new,
+                        "endpoint" => "stream",
+                        "meta" => _stream_event_meta(obj, received_at, page_new),
+                    ),
+                ),
+            )
+
+            _write_stream_jsonl_entries!(cfg, sink, entries)
             DBInterface.execute(sdb.db, "COMMIT;")
+            st.total_tweets += page_new
+            st.total_includes += include_count
+            st.seen_count += inserted
+            st.last_event_at = received_at
         catch e
             try
                 DBInterface.execute(sdb.db, "ROLLBACK;")
@@ -1397,36 +1655,10 @@ function handle_stream_line!(
             end
             rethrow(e)
         end
-    end
-
-    if cfg.write_includes && page_new > 0 && haskey(obj, "includes")
-        inc = obj["includes"]
-        for (k, arr) in inc
-            kstr = String(k)
-            for item in arr
-                write_jsonl(io, "include:$kstr", item)
-                st.total_includes += 1
-            end
-        end
-    end
-
-    if page_new > 0
-        received_at = string(Dates.now(Dates.UTC))
-        st.last_event_at = received_at
-        write_jsonl(
-            io,
-            "page",
-            Dict(
-                "page" => st.total_tweets,
-                "endpoint" => "stream",
-                "meta" => _stream_event_meta(obj, received_at, page_new),
-            ),
-        )
-        flush(io)
         return :tweet
     end
 
-    return haskey(obj, "errors") ? :errors : :ignored
+    return _json_haskey(obj, "errors") ? :errors : :ignored
 end
 
 function _stream_stop_reason(cfg::StreamConfig, st::StreamState, started_at::Float64)
@@ -1435,9 +1667,94 @@ function _stream_stop_reason(cfg::StreamConfig, st::StreamState, started_at::Flo
     return nothing
 end
 
+stream_now_utc() = string(Dates.now(Dates.UTC))
+
+function _refresh_stream_storage_stats!(cfg::StreamConfig, st::StreamState)
+    st.db_path = out_db(cfg)
+    st.db_size_bytes = isfile(st.db_path) ? stat(st.db_path).size : 0
+    return st
+end
+
 function _persist_stream_state!(cfg::StreamConfig, st::StreamState)
-    st.timestamp = string(Dates.now(Dates.UTC))
+    _refresh_stream_storage_stats!(cfg, st)
+    st.timestamp = stream_now_utc()
     save_state(out_stream_state(cfg), st)
+    return nothing
+end
+
+function _maybe_persist_stream_state!(
+    cfg::StreamConfig,
+    st::StreamState,
+    last_flush_ref::Base.RefValue{Float64};
+    force::Bool = false,
+)
+    now = time()
+    due =
+        cfg.state_flush_interval_seconds > 0 &&
+        (last_flush_ref[] <= 0 || (now - last_flush_ref[]) >= cfg.state_flush_interval_seconds)
+    if force || due
+        _persist_stream_state!(cfg, st)
+        last_flush_ref[] = now
+    end
+    return nothing
+end
+
+function _write_stream_gap!(
+    cfg::StreamConfig,
+    st::StreamState,
+    start_time_utc::AbstractString,
+    end_time_utc::AbstractString,
+    reason::AbstractString,
+)
+    isempty(start_time_utc) && return nothing
+    mkpath(cfg.out_dir)
+    open(out_stream_gaps(cfg), "a") do io
+        JSON3.write(
+            io,
+            Dict(
+                "task_name" => st.task_name,
+                "query" => st.query,
+                "rule_id" => st.rule_id,
+                "rule_tag" => st.rule_tag,
+                "start_time_utc" => String(start_time_utc),
+                "end_time_utc" => String(end_time_utc),
+                "reason" => String(reason),
+                "recorded_at" => stream_now_utc(),
+            ),
+        )
+        write(io, '\n')
+        flush(io)
+        cfg.durable_writes && _maybe_fsync(io)
+    end
+    return nothing
+end
+
+function _begin_stream_gap!(
+    st::StreamState,
+    pending_gap_start::Base.RefValue{Union{Nothing,String}},
+    pending_gap_reason::Base.RefValue{String},
+    reason::AbstractString,
+)
+    disconnected_at = stream_now_utc()
+    st.last_disconnect_at = disconnected_at
+    pending_gap_start[] === nothing && (pending_gap_start[] = disconnected_at)
+    isempty(pending_gap_reason[]) && (pending_gap_reason[] = String(reason))
+    return disconnected_at
+end
+
+function _finish_stream_gap!(
+    cfg::StreamConfig,
+    st::StreamState,
+    pending_gap_start::Base.RefValue{Union{Nothing,String}},
+    pending_gap_reason::Base.RefValue{String},
+    end_time_utc::AbstractString,
+    reason::AbstractString = pending_gap_reason[],
+)
+    pending_gap_start[] === nothing && return nothing
+    gap_reason = isempty(reason) ? "disconnected" : String(reason)
+    _write_stream_gap!(cfg, st, pending_gap_start[]::String, end_time_utc, gap_reason)
+    pending_gap_start[] = nothing
+    pending_gap_reason[] = ""
     return nothing
 end
 
@@ -1456,13 +1773,22 @@ end
 
 function _stream_response_outcome(resp, url::AbstractString; body::AbstractString = "")
     resp.status == 200 &&
-        return (kind = :ok, stop_reason = "", sleep_seconds = 0, activity = false)
+        return (
+            kind = :ok,
+            stop_reason = "",
+            sleep_seconds = 0,
+            activity = false,
+            status = 200,
+            error = "",
+        )
     if resp.status == 429
         return (
             kind = :retryable,
             stop_reason = "rate_limited",
             sleep_seconds = rate_limit_sleep_seconds(resp),
             activity = false,
+            status = resp.status,
+            error = "rate limited",
         )
     elseif 500 <= resp.status < 600
         return (
@@ -1470,6 +1796,8 @@ function _stream_response_outcome(resp, url::AbstractString; body::AbstractStrin
             stop_reason = "server_error",
             sleep_seconds = 0,
             activity = false,
+            status = resp.status,
+            error = "server error",
         )
     end
     _throw_stream_response_error(resp, url, body)
@@ -1479,23 +1807,27 @@ function _record_stream_line!(
     cfg::StreamConfig,
     st::StreamState,
     sdb::SeenDB,
-    io::IO,
+    sink,
     line::AbstractString,
     started_at::Float64,
     activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64} = Ref(time()),
 )
-    result = handle_stream_line!(cfg, st, sdb, io, line)
+    result = handle_stream_line!(cfg, st, sdb, sink, line)
     if result != :invalid
         activity_ref[] = true
+        st.consecutive_failures = 0
         st.stop_reason = ""
     end
-    _persist_stream_state!(cfg, st)
+    force_state = result in (:tweet, :errors)
+    _maybe_persist_stream_state!(cfg, st, state_flush_ref; force = force_state)
 
     stop_reason = _stream_stop_reason(cfg, st, started_at)
     if stop_reason !== nothing
         st.completed = true
         st.stop_reason = stop_reason
         _persist_stream_state!(cfg, st)
+        state_flush_ref[] = time()
     end
     return (result = result, stop_reason = stop_reason)
 end
@@ -1504,16 +1836,26 @@ function _process_stream_chunk!(
     cfg::StreamConfig,
     st::StreamState,
     sdb::SeenDB,
-    io::IO,
+    sink,
     pending_line::IOBuffer,
     chunk,
     started_at::Float64,
     activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64} = Ref(time()),
 )
     for b in chunk
         if b == UInt8('\n')
             line = String(take!(pending_line))
-            res = _record_stream_line!(cfg, st, sdb, io, line, started_at, activity_ref)
+            res = _record_stream_line!(
+                cfg,
+                st,
+                sdb,
+                sink,
+                line,
+                started_at,
+                activity_ref,
+                state_flush_ref,
+            )
             res.stop_reason !== nothing && return res
         else
             write(pending_line, b)
@@ -1526,14 +1868,24 @@ function _flush_pending_stream_line!(
     cfg::StreamConfig,
     st::StreamState,
     sdb::SeenDB,
-    io::IO,
+    sink,
     pending_line::IOBuffer,
     started_at::Float64,
     activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64} = Ref(time()),
 )
     position(pending_line) == 0 && return (result = :empty, stop_reason = nothing)
     line = String(take!(pending_line))
-    return _record_stream_line!(cfg, st, sdb, io, line, started_at, activity_ref)
+    return _record_stream_line!(
+        cfg,
+        st,
+        sdb,
+        sink,
+        line,
+        started_at,
+        activity_ref,
+        state_flush_ref,
+    )
 end
 
 _stream_completed_outcome(stop_reason::AbstractString, activity_ref::Base.RefValue{Bool}) = (
@@ -1541,6 +1893,8 @@ _stream_completed_outcome(stop_reason::AbstractString, activity_ref::Base.RefVal
     stop_reason = String(stop_reason),
     sleep_seconds = 0,
     activity = activity_ref[],
+    status = 0,
+    error = "",
 )
 
 _stream_disconnected_outcome(activity_ref::Base.RefValue{Bool}) = (
@@ -1548,25 +1902,29 @@ _stream_disconnected_outcome(activity_ref::Base.RefValue{Bool}) = (
     stop_reason = "disconnected",
     sleep_seconds = 0,
     activity = activity_ref[],
+    status = 0,
+    error = "",
 )
 
 function _flush_pending_stream_outcome!(
     cfg::StreamConfig,
     st::StreamState,
     sdb::SeenDB,
-    io::IO,
+    sink,
     pending_line::IOBuffer,
     started_at::Float64,
     activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64} = Ref(time()),
 )
     res = _flush_pending_stream_line!(
         cfg,
         st,
         sdb,
-        io,
+        sink,
         pending_line,
         started_at,
         activity_ref,
+        state_flush_ref,
     )
     res.stop_reason !== nothing &&
         return _stream_completed_outcome(res.stop_reason, activity_ref)
@@ -1577,10 +1935,11 @@ function _read_stream_lines!(
     cfg::StreamConfig,
     st::StreamState,
     sdb::SeenDB,
-    io::IO,
+    sink,
     http,
     started_at::Float64,
     activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64} = Ref(time()),
 )
     pending_line = IOBuffer()
     try
@@ -1591,10 +1950,11 @@ function _read_stream_lines!(
                     cfg,
                     st,
                     sdb,
-                    io,
+                    sink,
                     pending_line,
                     started_at,
                     activity_ref,
+                    state_flush_ref,
                 )
                 outcome !== nothing && return outcome
                 return _stream_disconnected_outcome(activity_ref)
@@ -1603,11 +1963,12 @@ function _read_stream_lines!(
                 cfg,
                 st,
                 sdb,
-                io,
+                sink,
                 pending_line,
                 chunk,
                 started_at,
                 activity_ref,
+                state_flush_ref,
             )
             if res.stop_reason !== nothing
                 return _stream_completed_outcome(res.stop_reason, activity_ref)
@@ -1618,10 +1979,11 @@ function _read_stream_lines!(
             cfg,
             st,
             sdb,
-            io,
+            sink,
             pending_line,
             started_at,
             activity_ref,
+            state_flush_ref,
         )
         outcome !== nothing && return outcome
         rethrow(e)
@@ -1633,7 +1995,7 @@ function _stream_reconnect_decision(cfg::StreamConfig, reconnects::Int)
         return (should_reconnect = false, reconnects = reconnects, stop_reason = "")
     end
     next_reconnects = reconnects + 1
-    if next_reconnects > cfg.max_reconnects
+    if cfg.max_reconnects > 0 && next_reconnects > cfg.max_reconnects
         return (
             should_reconnect = false,
             reconnects = next_reconnects,
@@ -1655,6 +2017,7 @@ function run_stream_collector(cfg::StreamConfig)
     headers = bearer_headers(user_agent = "julia-x-collector/stream")
     rule = ensure_stream_rule!(cfg, headers)
     query = build_query(cfg)
+    sdb = init_seen_db(cfg)
 
     st = load_stream_state(out_stream_state(cfg))
     if st === nothing || st.query != query || st.rule_tag != cfg.rule_tag
@@ -1666,150 +2029,282 @@ function run_stream_collector(cfg::StreamConfig)
     st.rule_id = rule.id
     st.completed = false
     st.stop_reason = ""
+    st.last_error = ""
+    st.last_status = 0
+    st.consecutive_failures = 0
+    st.seen_count = count_seen(sdb)
     _persist_stream_state!(cfg, st)
+    state_flush_ref = Ref(time())
 
     params = build_stream_params(cfg)
     url = stream_url(cfg)
-    sdb = init_seen_db(cfg)
     started_at = time()
     reconnects = 0
     delay = cfg.reconnect_initial_delay_seconds
+    pending_gap_start = Ref{Union{Nothing,String}}(nothing)
+    pending_gap_reason = Ref("")
+    writer = Ref{Union{Nothing,StreamJsonlWriter}}(nothing)
 
     try
-        open(out_jsonl(cfg), "a") do io
-            while true
+        writer[] = _open_stream_jsonl_writer(cfg)
+        while true
+            stop_reason = _stream_stop_reason(cfg, st, started_at)
+            if stop_reason !== nothing
+                st.completed = true
+                st.stop_reason = stop_reason
+                _finish_stream_gap!(
+                    cfg,
+                    st,
+                    pending_gap_start,
+                    pending_gap_reason,
+                    stream_now_utc(),
+                    stop_reason,
+                )
+                _persist_stream_state!(cfg, st)
+                state_flush_ref[] = time()
+                break
+            end
+
+            st.connection_count += 1
+            _persist_stream_state!(cfg, st)
+            state_flush_ref[] = time()
+            @info "Connect stream" connection = st.connection_count tweets =
+                st.total_tweets
+
+            activity_this_connection = Ref(false)
+            try
+                outcome = HTTP.open(
+                    :GET,
+                    url,
+                    headers;
+                    query = params,
+                    status_exception = false,
+                    readtimeout = cfg.idle_timeout_seconds,
+                ) do http
+                    resp = HTTP.startread(http)
+                    if resp.status != 200
+                        body =
+                            resp.status == 429 || 500 <= resp.status < 600 ? "" :
+                            _stream_response_body(http)
+                        status_outcome =
+                            _stream_response_outcome(resp, url; body = body)
+                        if status_outcome.stop_reason == "rate_limited"
+                            @warn "Stream rate limited" sleep_seconds =
+                                status_outcome.sleep_seconds
+                        elseif status_outcome.stop_reason == "server_error"
+                            @warn "Stream server error" status = resp.status
+                        end
+                        return status_outcome
+                    end
+
+                    connected_at = stream_now_utc()
+                    st.last_connected_at = connected_at
+                    st.last_status = 200
+                    st.last_error = ""
+                    _finish_stream_gap!(
+                        cfg,
+                        st,
+                        pending_gap_start,
+                        pending_gap_reason,
+                        connected_at,
+                    )
+                    _maybe_persist_stream_state!(
+                        cfg,
+                        st,
+                        state_flush_ref;
+                        force = true,
+                    )
+
+                    return _read_stream_lines!(
+                        cfg,
+                        st,
+                        sdb,
+                        writer[]::StreamJsonlWriter,
+                        http,
+                        started_at,
+                        activity_this_connection,
+                        state_flush_ref,
+                    )
+                end
+
+                if st.completed
+                    break
+                end
+
+                if activity_this_connection[]
+                    reconnects = 0
+                    delay = cfg.reconnect_initial_delay_seconds
+                    st.consecutive_failures = 0
+                end
+
+                if !isempty(outcome.stop_reason)
+                    st.stop_reason = outcome.stop_reason
+                    st.last_status = outcome.status
+                    st.last_error = outcome.error
+                    if outcome.kind in (:retryable, :disconnected)
+                        _begin_stream_gap!(
+                            st,
+                            pending_gap_start,
+                            pending_gap_reason,
+                            outcome.stop_reason,
+                        )
+                    end
+                    _persist_stream_state!(cfg, st)
+                    state_flush_ref[] = time()
+                end
+
+                decision = _stream_reconnect_decision(cfg, reconnects)
+                reconnects = decision.reconnects
+                st.consecutive_failures = reconnects
+                if !decision.should_reconnect
+                    st.stop_reason =
+                        isempty(decision.stop_reason) ? outcome.stop_reason :
+                        decision.stop_reason
+                    _finish_stream_gap!(
+                        cfg,
+                        st,
+                        pending_gap_start,
+                        pending_gap_reason,
+                        stream_now_utc(),
+                        st.stop_reason,
+                    )
+                    _persist_stream_state!(cfg, st)
+                    state_flush_ref[] = time()
+                    break
+                end
+                _persist_stream_state!(cfg, st)
+                state_flush_ref[] = time()
+                sleep_seconds =
+                    outcome.sleep_seconds > 0 ? outcome.sleep_seconds :
+                    delay + rand() * 0.5
+                sleep(sleep_seconds)
+                delay = min(delay * 1.8, cfg.reconnect_max_delay_seconds)
+
+            catch e
+                if e isa InterruptException
+                    st.stop_reason = "interrupted"
+                    _finish_stream_gap!(
+                        cfg,
+                        st,
+                        pending_gap_start,
+                        pending_gap_reason,
+                        stream_now_utc(),
+                        "interrupted",
+                    )
+                    _persist_stream_state!(cfg, st)
+                    rethrow()
+                elseif e isa XApiAccessError
+                    st.stop_reason = "api_error"
+                    st.last_status = e.status
+                    st.last_error = sprint(showerror, e)
+                    _finish_stream_gap!(
+                        cfg,
+                        st,
+                        pending_gap_start,
+                        pending_gap_reason,
+                        stream_now_utc(),
+                        "api_error",
+                    )
+                    _persist_stream_state!(cfg, st)
+                    rethrow()
+                end
+
                 stop_reason = _stream_stop_reason(cfg, st, started_at)
                 if stop_reason !== nothing
                     st.completed = true
                     st.stop_reason = stop_reason
+                    _finish_stream_gap!(
+                        cfg,
+                        st,
+                        pending_gap_start,
+                        pending_gap_reason,
+                        stream_now_utc(),
+                        stop_reason,
+                    )
                     _persist_stream_state!(cfg, st)
+                    state_flush_ref[] = time()
                     break
                 end
 
-                st.connection_count += 1
-                _persist_stream_state!(cfg, st)
-                @info "Connect stream" connection = st.connection_count tweets =
-                    st.total_tweets
-
-                activity_this_connection = Ref(false)
-                try
-                    outcome = HTTP.open(
-                        :GET,
-                        url,
-                        headers;
-                        query = params,
-                        status_exception = false,
-                        readtimeout = cfg.idle_timeout_seconds,
-                    ) do http
-                        resp = HTTP.startread(http)
-                        if resp.status != 200
-                            body =
-                                resp.status == 429 || 500 <= resp.status < 600 ? "" :
-                                _stream_response_body(http)
-                            status_outcome =
-                                _stream_response_outcome(resp, url; body = body)
-                            if status_outcome.stop_reason == "rate_limited"
-                                @warn "Stream rate limited" sleep_seconds =
-                                    status_outcome.sleep_seconds
-                            elseif status_outcome.stop_reason == "server_error"
-                                @warn "Stream server error" status = resp.status
-                            end
-                            return status_outcome
-                        end
-
-                        return _read_stream_lines!(
-                            cfg,
-                            st,
-                            sdb,
-                            io,
-                            http,
-                            started_at,
-                            activity_this_connection,
-                        )
-                    end
-
-                    if st.completed
-                        break
-                    end
-
-                    if activity_this_connection[]
-                        reconnects = 0
-                        delay = cfg.reconnect_initial_delay_seconds
-                    end
-
-                    if outcome.stop_reason in ("rate_limited", "server_error")
-                        st.stop_reason = outcome.stop_reason
-                        _persist_stream_state!(cfg, st)
-                    end
-
-                    decision = _stream_reconnect_decision(cfg, reconnects)
-                    reconnects = decision.reconnects
-                    if !decision.should_reconnect
-                        if !isempty(decision.stop_reason)
-                            st.stop_reason = decision.stop_reason
-                            _persist_stream_state!(cfg, st)
-                        end
-                        break
-                    end
-                    sleep_seconds =
-                        outcome.sleep_seconds > 0 ? outcome.sleep_seconds :
-                        delay + rand() * 0.5
-                    sleep(sleep_seconds)
-                    delay = min(delay * 1.8, cfg.reconnect_max_delay_seconds)
-
-                catch e
-                    if e isa InterruptException
-                        st.stop_reason = "interrupted"
-                        _persist_stream_state!(cfg, st)
-                        rethrow()
-                    elseif e isa XApiAccessError
-                        st.stop_reason = "api_error"
-                        _persist_stream_state!(cfg, st)
-                        rethrow()
-                    end
-
-                    stop_reason = _stream_stop_reason(cfg, st, started_at)
-                    if stop_reason !== nothing
-                        st.completed = true
-                        st.stop_reason = stop_reason
-                        _persist_stream_state!(cfg, st)
-                        break
-                    end
-
-                    if activity_this_connection[]
-                        reconnects = 0
-                        delay = cfg.reconnect_initial_delay_seconds
-                    end
-
-                    if _looks_like_stream_timeout(e) && !cfg.reconnect
-                        st.completed = true
-                        st.stop_reason = "idle_timeout"
-                        _persist_stream_state!(cfg, st)
-                        break
-                    end
-
-                    @warn "Stream connection failed" exception = e reconnects = reconnects
-                    decision = _stream_reconnect_decision(cfg, reconnects)
-                    reconnects = decision.reconnects
-                    if !decision.should_reconnect
-                        st.stop_reason =
-                            isempty(decision.stop_reason) ? "stream_error" :
-                            decision.stop_reason
-                        _persist_stream_state!(cfg, st)
-                        rethrow()
-                    end
-                    sleep(delay + rand() * 0.5)
-                    delay = min(delay * 1.8, cfg.reconnect_max_delay_seconds)
+                if activity_this_connection[]
+                    reconnects = 0
+                    delay = cfg.reconnect_initial_delay_seconds
+                    st.consecutive_failures = 0
                 end
+
+                error_text = sprint(showerror, e)
+                reason = _looks_like_stream_timeout(e) ? "idle_timeout" : "stream_error"
+                st.stop_reason = reason
+                st.last_status = 0
+                st.last_error = error_text
+                _begin_stream_gap!(
+                    st,
+                    pending_gap_start,
+                    pending_gap_reason,
+                    reason,
+                )
+
+                if _looks_like_stream_timeout(e) && !cfg.reconnect
+                    st.completed = true
+                    st.stop_reason = "idle_timeout"
+                    _finish_stream_gap!(
+                        cfg,
+                        st,
+                        pending_gap_start,
+                        pending_gap_reason,
+                        stream_now_utc(),
+                        "idle_timeout",
+                    )
+                    _persist_stream_state!(cfg, st)
+                    state_flush_ref[] = time()
+                    break
+                end
+
+                @warn "Stream connection failed" exception = e reconnects = reconnects
+                decision = _stream_reconnect_decision(cfg, reconnects)
+                reconnects = decision.reconnects
+                st.consecutive_failures = reconnects
+                if !decision.should_reconnect
+                    st.stop_reason =
+                        isempty(decision.stop_reason) ? "stream_error" :
+                        decision.stop_reason
+                    _finish_stream_gap!(
+                        cfg,
+                        st,
+                        pending_gap_start,
+                        pending_gap_reason,
+                        stream_now_utc(),
+                        st.stop_reason,
+                    )
+                    _persist_stream_state!(cfg, st)
+                    state_flush_ref[] = time()
+                    rethrow()
+                end
+                _persist_stream_state!(cfg, st)
+                state_flush_ref[] = time()
+                sleep(delay + rand() * 0.5)
+                delay = min(delay * 1.8, cfg.reconnect_max_delay_seconds)
             end
         end
 
         if !st.completed && isempty(st.stop_reason)
             st.stop_reason = "disconnected"
+            _finish_stream_gap!(
+                cfg,
+                st,
+                pending_gap_start,
+                pending_gap_reason,
+                stream_now_utc(),
+                "disconnected",
+            )
             _persist_stream_state!(cfg, st)
         end
         return st
     finally
+        try
+            writer[] !== nothing && _close_stream_jsonl_writer!(writer[]::StreamJsonlWriter)
+        catch
+        end
         try
             DBInterface.close!(sdb.db)
         catch
@@ -1970,12 +2465,12 @@ function run_collector(cfg::SearchConfig)
                 end
 
                 page_new = 0
-                if haskey(res, "data")
+                if _json_haskey(res, "data")
                     DBInterface.execute(sdb.db, "BEGIN;")
                     try
                         seen_at = utc_now_z(lag_seconds = 0)
-                        for tw in res["data"]
-                            tid = safe_str(get(tw, "id", nothing); default = "")
+                        for tw in _json_items(_json_get(res, "data", nothing))
+                            tid = safe_str(_json_get(tw, "id", nothing); default = "")
                             isempty(tid) && continue
                             if mark_seen!(sdb, tid, seen_at)
                                 write_jsonl(io, "tweet", tw)
@@ -1993,18 +2488,18 @@ function run_collector(cfg::SearchConfig)
                     end
                 end
 
-                if cfg.write_includes && page_new > 0 && haskey(res, "includes")
-                    inc = res["includes"]
-                    for (k, arr) in inc
+                if cfg.write_includes && page_new > 0 && _json_haskey(res, "includes")
+                    inc = _json_get(res, "includes", nothing)
+                    for (k, arr) in _json_pairs(inc)
                         kstr = String(k)
-                        for obj in arr
+                        for obj in _json_items(arr)
                             write_jsonl(io, "include:$kstr", obj)
                             st2.total_includes += 1
                         end
                     end
                 end
 
-                meta = get(res, "meta", nothing)
+                meta = _json_get(res, "meta", nothing)
                 write_jsonl(
                     io,
                     "page",
@@ -2016,12 +2511,8 @@ function run_collector(cfg::SearchConfig)
                 )
                 flush(io)
 
-                next_token =
-                    meta === nothing ? nothing :
-                    (
-                        isnull(get(meta, "next_token", nothing)) ? nothing :
-                        String(get(meta, "next_token", nothing))
-                    )
+                next_raw = _json_get(meta, "next_token", nothing)
+                next_token = isnull(next_raw) ? nothing : safe_str(next_raw; default = "")
 
                 st2.next_token = next_token
                 st2.completed = (next_token === nothing)
@@ -2109,23 +2600,23 @@ const TweetRow = NamedTuple{
 }
 
 function tweet_to_row(tw)::TweetRow
-    pm = get(tw, "public_metrics", nothing)
+    pm = _json_get(tw, "public_metrics", nothing)
     return (
-        id = safe_str(get(tw, "id", nothing); default = ""),
-        created_at = safe_str(get(tw, "created_at", nothing); default = ""),
-        author_id = safe_str(get(tw, "author_id", nothing); default = ""),
-        lang = safe_str(get(tw, "lang", nothing); default = ""),
-        possibly_sensitive = safe_bool(get(tw, "possibly_sensitive", nothing)),
-        like_count = pm === nothing ? missing : safe_int(get(pm, "like_count", nothing)),
+        id = safe_str(_json_get(tw, "id", nothing); default = ""),
+        created_at = safe_str(_json_get(tw, "created_at", nothing); default = ""),
+        author_id = safe_str(_json_get(tw, "author_id", nothing); default = ""),
+        lang = safe_str(_json_get(tw, "lang", nothing); default = ""),
+        possibly_sensitive = safe_bool(_json_get(tw, "possibly_sensitive", nothing)),
+        like_count = pm === nothing ? missing : safe_int(_json_get(pm, "like_count", nothing)),
         retweet_count = pm === nothing ? missing :
-                        safe_int(get(pm, "retweet_count", nothing)),
-        reply_count = pm === nothing ? missing : safe_int(get(pm, "reply_count", nothing)),
-        quote_count = pm === nothing ? missing : safe_int(get(pm, "quote_count", nothing)),
+                        safe_int(_json_get(pm, "retweet_count", nothing)),
+        reply_count = pm === nothing ? missing : safe_int(_json_get(pm, "reply_count", nothing)),
+        quote_count = pm === nothing ? missing : safe_int(_json_get(pm, "quote_count", nothing)),
         bookmark_count = pm === nothing ? missing :
-                         safe_int(get(pm, "bookmark_count", nothing)),
+                         safe_int(_json_get(pm, "bookmark_count", nothing)),
         impression_count = pm === nothing ? missing :
-                           safe_int(get(pm, "impression_count", nothing)),
-        text = safe_str(get(tw, "text", nothing); default = ""),
+                           safe_int(_json_get(pm, "impression_count", nothing)),
+        text = safe_str(_json_get(tw, "text", nothing); default = ""),
     )
 end
 
@@ -2175,6 +2666,35 @@ function ensure_offset_boundary!(io::IO, offset::Int)
     return
 end
 
+function _same_jsonl_path(a::AbstractString, b::AbstractString)::Bool
+    try
+        return abspath(a) == abspath(b)
+    catch
+        return String(a) == String(b)
+    end
+end
+
+function _looks_like_json_unexpected_eof(e)::Bool
+    msg = lowercase(sprint(showerror, e))
+    return occursin("unexpectedeof", msg) ||
+           occursin("unexpected eof", msg) ||
+           occursin("unexpected end", msg) ||
+           occursin("unexpected end-of-file", msg)
+end
+
+function _is_active_partial_jsonl_error(
+    e,
+    jsonl::AbstractString,
+    active_path::Union{Nothing,String},
+    line_end_offset::Int,
+    file_end_offset::Int,
+)::Bool
+    active_path === nothing && return false
+    _same_jsonl_path(jsonl, active_path) || return false
+    line_end_offset == file_end_offset || return false
+    return _looks_like_json_unexpected_eof(e)
+end
+
 function write_csv_batch!(cfg::SearchConfig, batch::Vector{TweetRow})
     isempty(batch) && return
     CSV.write(out_csv(cfg), batch; append = isfile(out_csv(cfg)))
@@ -2221,14 +2741,18 @@ function write_arrow_batch!(cfg::SearchConfig, batch::Vector{TweetRow})
     end
 end
 
-function convert_outputs(cfg::SearchConfig)
+function _convert_outputs_from_jsonl_paths(
+    cfg::SearchConfig,
+    jsonl_paths::Vector{String},
+    state_path::AbstractString;
+    active_path::Union{Nothing,String} = nothing,
+)
     validate!(cfg)
     mkpath(cfg.out_dir)
 
-    jsonl = out_jsonl(cfg)
-    isfile(jsonl) || error("JSONL not found: $jsonl")
+    isempty(jsonl_paths) && error("JSONL not found")
 
-    st = load_state(out_state(cfg))
+    st = load_state(state_path)
     st === nothing && (st = CollectorState())
 
     offset = cfg.convert_incremental ? st.converted_jsonl_offset : 0
@@ -2244,7 +2768,7 @@ function convert_outputs(cfg::SearchConfig)
         end
     end
 
-    fsz = stat(jsonl).size
+    fsz = sum(stat(p).size for p in jsonl_paths)
     if offset > fsz
         @warn "Converted offset beyond JSONL size; resetting to 0" offset = offset size =
             fsz
@@ -2260,32 +2784,71 @@ function convert_outputs(cfg::SearchConfig)
     sizehint!(batch, cfg.convert_batch_size)
 
     new_offset = offset
+    last_good_offset = offset
+    file_base_offset = 0
+    stop_at_partial = false
 
-    open(jsonl, "r") do io
-        ensure_offset_boundary!(io, offset)
+    for jsonl in jsonl_paths
+        file_size = stat(jsonl).size
+        if offset >= file_base_offset + file_size
+            file_base_offset += file_size
+            continue
+        end
+        file_offset = max(offset - file_base_offset, 0)
+        open(jsonl, "r") do io
+            ensure_offset_boundary!(io, file_offset)
+            last_good_offset = max(last_good_offset, file_base_offset + position(io))
+            new_offset = last_good_offset
 
-        while !eof(io)
-            line = readline(io)
-            new_offset = position(io)
+            while !eof(io)
+                line_start_offset = file_base_offset + position(io)
+                line = readline(io)
+                line_end_offset = file_base_offset + position(io)
 
-            s = strip(line)
-            isempty(s) && continue
-
-            try
-                obj = JSON3.read(s)
-                kind = safe_str(get(obj, "kind", nothing); default = "")
-                kind == "tweet" || continue
-                push!(batch, tweet_to_row(obj["data"]))
-
-                if length(batch) >= cfg.convert_batch_size
-                    cfg.emit_csv && write_csv_batch!(cfg, batch)
-                    cfg.emit_arrow && write_arrow_batch!(cfg, batch)
-                    empty!(batch)
+                s = strip(line)
+                if isempty(s)
+                    last_good_offset = line_end_offset
+                    new_offset = last_good_offset
+                    continue
                 end
-            catch e
-                @warn "JSONL parse error (skip)" exception = e
+
+                try
+                    obj = JSON3.read(s)
+                    kind = safe_str(_json_get(obj, "kind", nothing); default = "")
+                    if kind == "tweet"
+                        data = _json_get(obj, "data", nothing)
+                        data === nothing || push!(batch, tweet_to_row(data))
+
+                        if length(batch) >= cfg.convert_batch_size
+                            cfg.emit_csv && write_csv_batch!(cfg, batch)
+                            cfg.emit_arrow && write_arrow_batch!(cfg, batch)
+                            empty!(batch)
+                        end
+                    end
+                    last_good_offset = line_end_offset
+                    new_offset = last_good_offset
+                catch e
+                    if _is_active_partial_jsonl_error(
+                        e,
+                        jsonl,
+                        active_path,
+                        line_end_offset,
+                        file_base_offset + file_size,
+                    )
+                        @warn "JSONL partial final line; will retry on next conversion" path =
+                            jsonl offset = line_start_offset
+                        new_offset = last_good_offset
+                        stop_at_partial = true
+                        break
+                    end
+                    @warn "JSONL parse error (skip)" exception = e path = jsonl
+                    last_good_offset = line_end_offset
+                    new_offset = last_good_offset
+                end
             end
         end
+        file_base_offset += file_size
+        stop_at_partial && break
     end
 
     if !isempty(batch)
@@ -2296,14 +2859,31 @@ function convert_outputs(cfg::SearchConfig)
 
     st.converted_jsonl_offset = new_offset
     st.converted_at = string(Dates.now(Dates.UTC))
-    save_state(out_state(cfg), st)
+    save_state(state_path, st)
 
     @info "Conversion done" csv = cfg.emit_csv arrow = cfg.emit_arrow new_offset =
         new_offset
     return (converted_offset = new_offset, converted_at = st.converted_at)
 end
 
-convert_outputs(cfg::StreamConfig) = convert_outputs(as_search_config(cfg))
+function convert_outputs(cfg::SearchConfig)
+    jsonl = out_jsonl(cfg)
+    isfile(jsonl) || error("JSONL not found: $jsonl")
+    return _convert_outputs_from_jsonl_paths(cfg, [jsonl], out_state(cfg))
+end
+
+function convert_outputs(cfg::StreamConfig)
+    validate!(cfg)
+    paths = stream_jsonl_paths(cfg)
+    isempty(paths) && error("JSONL not found: $(out_jsonl(cfg))")
+    scfg = as_search_config(cfg)
+    return _convert_outputs_from_jsonl_paths(
+        scfg,
+        paths,
+        out_state(scfg);
+        active_path = out_jsonl(cfg),
+    )
+end
 
 # =========================================================
 # Wide変換（includes: users/media/places/tweets の結合）
@@ -2333,7 +2913,7 @@ wide_json_str(x) = begin
         missing
     end
 end
-wide_getv(obj, key, default = nothing) = haskey(obj, key) ? obj[key] : default
+wide_getv(obj, key, default = nothing) = _json_get(obj, String(key), default)
 
 function wide_author_cols(author_id::AbstractString, users::Dict{String,Any})
     u = get(users, author_id, nothing)
@@ -2661,16 +3241,20 @@ function tweet_to_row_wide(
     )
 end
 
-function convert_outputs_wide(cfg::SearchConfig; sep::AbstractString = ";")
+function _convert_outputs_wide_from_jsonl_paths(
+    cfg::SearchConfig,
+    jsonl_paths::Vector{String},
+    state_path::AbstractString;
+    sep::AbstractString = ";",
+    active_path::Union{Nothing,String} = nothing,
+)
     validate!(cfg)
     mkpath(cfg.out_dir)
 
-    jsonl = out_jsonl(cfg)
-    isfile(jsonl) || error("JSONL not found: $jsonl")
+    isempty(jsonl_paths) && error("JSONL not found")
 
     csv_path = out_csv_wide(cfg)
     arrow_path = out_arrow_wide(cfg)
-    state_path = out_state_wide(cfg)
 
     st = load_state(state_path)
     st === nothing && (st = CollectorState())
@@ -2682,7 +3266,7 @@ function convert_outputs_wide(cfg::SearchConfig; sep::AbstractString = ";")
         cfg.emit_arrow && !isfile(arrow_path) && (offset = 0)
     end
 
-    fsz = stat(jsonl).size
+    fsz = sum(stat(p).size for p in jsonl_paths)
     offset > fsz && (offset = 0)
 
     if offset == 0
@@ -2693,6 +3277,7 @@ function convert_outputs_wide(cfg::SearchConfig; sep::AbstractString = ";")
     batch = Vector{NamedTuple}()
     sizehint!(batch, cfg.convert_batch_size)
     new_offset = offset
+    last_good_offset = offset
     wrote_arrow = false
 
     pending_tweets = Vector{Any}()
@@ -2745,63 +3330,101 @@ function convert_outputs_wide(cfg::SearchConfig; sep::AbstractString = ";")
 
     last_kind = :none
 
-    open(jsonl, "r") do io
-        ensure_offset_boundary!(io, offset)
+    file_base_offset = 0
+    stop_at_partial = false
+    for jsonl in jsonl_paths
+        file_size = stat(jsonl).size
+        if offset >= file_base_offset + file_size
+            file_base_offset += file_size
+            continue
+        end
+        file_offset = max(offset - file_base_offset, 0)
+        open(jsonl, "r") do io
+            ensure_offset_boundary!(io, file_offset)
+            last_good_offset = max(last_good_offset, file_base_offset + position(io))
+            new_offset = last_good_offset
 
-        while !eof(io)
-            line = readline(io)
-            new_offset = position(io)
+            while !eof(io)
+                line_start_offset = file_base_offset + position(io)
+                line = readline(io)
+                line_end_offset = file_base_offset + position(io)
 
-            s = strip(line)
-            isempty(s) && continue
-
-            try
-                obj = JSON3.read(s)
-                kind = safe_str(get(obj, "kind", nothing); default = "")
-
-                if kind == "tweet"
-                    # page 無しで tweet が延々続く場合のOOM回避
-                    if length(pending_tweets) >= MAX_PENDING_WITHOUT_PAGE
-                        flush_pending!()
-                    end
-                    # includes の後に次の tweet が来たら、前ページ分は確定している可能性が高い
-                    if last_kind in (:include, :page) && !isempty(pending_tweets)
-                        flush_pending!()
-                    end
-                    push!(pending_tweets, obj["data"])
-                    last_kind = :tweet
-
-                elseif startswith(kind, "include:")
-                    suf = replace(kind, "include:" => "")
-                    d = obj["data"]
-                    if suf == "users"
-                        uid = safe_str(wide_getv(d, "id", nothing); default = "")
-                        !isempty(uid) && (users_cache[uid] = d)
-                    elseif suf == "media"
-                        mk = safe_str(wide_getv(d, "media_key", nothing); default = "")
-                        !isempty(mk) && (media_cache[mk] = d)
-                    elseif suf == "places"
-                        pid = safe_str(wide_getv(d, "id", nothing); default = "")
-                        !isempty(pid) && (places_cache[pid] = d)
-                    elseif suf == "tweets"
-                        tid = safe_str(wide_getv(d, "id", nothing); default = "")
-                        !isempty(tid) && (included_tweets_cache[tid] = d)
-                    end
-                    last_kind = :include
-
-                elseif kind == "page"
-                    # ページ境界で flush
-                    flush_pending!()
-                    last_kind = :page
-
-                else
-                    # その他kindは無視
+                s = strip(line)
+                if isempty(s)
+                    last_good_offset = line_end_offset
+                    new_offset = last_good_offset
+                    continue
                 end
 
-            catch e
-                @warn "JSONL parse error (skip)" exception = e offset = new_offset
+                try
+                    obj = JSON3.read(s)
+                    kind = safe_str(_json_get(obj, "kind", nothing); default = "")
+
+                    if kind == "tweet"
+                        # page 無しで tweet が延々続く場合のOOM回避
+                        if length(pending_tweets) >= MAX_PENDING_WITHOUT_PAGE
+                            flush_pending!()
+                        end
+                        # includes の後に次の tweet が来たら、前ページ分は確定している可能性が高い
+                        if last_kind in (:include, :page) && !isempty(pending_tweets)
+                            flush_pending!()
+                        end
+                        data = _json_get(obj, "data", nothing)
+                        data === nothing || push!(pending_tweets, data)
+                        last_kind = :tweet
+
+                    elseif startswith(kind, "include:")
+                        suf = replace(kind, "include:" => "")
+                        d = _json_get(obj, "data", nothing)
+                        if suf == "users"
+                            uid = safe_str(wide_getv(d, "id", nothing); default = "")
+                            !isempty(uid) && (users_cache[uid] = d)
+                        elseif suf == "media"
+                            mk = safe_str(wide_getv(d, "media_key", nothing); default = "")
+                            !isempty(mk) && (media_cache[mk] = d)
+                        elseif suf == "places"
+                            pid = safe_str(wide_getv(d, "id", nothing); default = "")
+                            !isempty(pid) && (places_cache[pid] = d)
+                        elseif suf == "tweets"
+                            tid = safe_str(wide_getv(d, "id", nothing); default = "")
+                            !isempty(tid) && (included_tweets_cache[tid] = d)
+                        end
+                        last_kind = :include
+
+                    elseif kind == "page"
+                        # ページ境界で flush
+                        flush_pending!()
+                        last_kind = :page
+
+                    else
+                        # その他kindは無視
+                    end
+                    last_good_offset = line_end_offset
+                    new_offset = last_good_offset
+
+                catch e
+                    if _is_active_partial_jsonl_error(
+                        e,
+                        jsonl,
+                        active_path,
+                        line_end_offset,
+                        file_base_offset + file_size,
+                    )
+                        @warn "JSONL partial final line; will retry on next wide conversion" path =
+                            jsonl offset = line_start_offset
+                        new_offset = last_good_offset
+                        stop_at_partial = true
+                        break
+                    end
+                    @warn "JSONL parse error (skip)" exception = e offset = new_offset path =
+                        jsonl
+                    last_good_offset = line_end_offset
+                    new_offset = last_good_offset
+                end
             end
         end
+        file_base_offset += file_size
+        stop_at_partial && break
     end
 
     flush_pending!()
@@ -2827,7 +3450,29 @@ function convert_outputs_wide(cfg::SearchConfig; sep::AbstractString = ";")
     return (converted_offset = new_offset, csv_path = csv_path, arrow_path = arrow_path)
 end
 
-convert_outputs_wide(cfg::StreamConfig; sep::AbstractString = ";") =
-    convert_outputs_wide(as_search_config(cfg); sep = sep)
+function convert_outputs_wide(cfg::SearchConfig; sep::AbstractString = ";")
+    jsonl = out_jsonl(cfg)
+    isfile(jsonl) || error("JSONL not found: $jsonl")
+    return _convert_outputs_wide_from_jsonl_paths(
+        cfg,
+        [jsonl],
+        out_state_wide(cfg);
+        sep = sep,
+    )
+end
+
+function convert_outputs_wide(cfg::StreamConfig; sep::AbstractString = ";")
+    validate!(cfg)
+    paths = stream_jsonl_paths(cfg)
+    isempty(paths) && error("JSONL not found: $(out_jsonl(cfg))")
+    scfg = as_search_config(cfg)
+    return _convert_outputs_wide_from_jsonl_paths(
+        scfg,
+        paths,
+        out_state_wide(scfg);
+        sep = sep,
+        active_path = out_jsonl(cfg),
+    )
+end
 
 end # module
