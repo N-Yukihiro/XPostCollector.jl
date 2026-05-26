@@ -26,8 +26,11 @@ using XPostCollector:
     tweet_to_row,
     parse_usage_summary,
     rate_limit_sleep_seconds,
+    fetch_stream_json_with_retry,
     build_stream_params,
     handle_stream_line!,
+    _body_to_text,
+    _looks_like_stream_timeout,
     _process_stream_chunk!,
     _flush_pending_stream_line!,
     _read_stream_lines!,
@@ -138,6 +141,14 @@ function write_jsonl_lines(path::String, lines::Vector{String})
             write(io, '\n')
         end
     end
+end
+
+function gzip_bytes(s::AbstractString)
+    buf = IOBuffer()
+    gz = HTTP.GzipCompressorStream(buf)
+    write(gz, String(s))
+    close(gz)
+    return take!(buf)
 end
 
 function jsonl_tweet_line(
@@ -254,6 +265,9 @@ Base.write(::FailingIO, ::AbstractVector{UInt8}) = error("write failed")
 Base.write(::FailingIO, ::AbstractString) = error("write failed")
 Base.write(::FailingIO, ::Char) = error("write failed")
 Base.flush(::FailingIO) = nothing
+
+struct BinaryShowError <: Exception end
+Base.showerror(io::IO, ::BinaryShowError) = write(io, UInt8[0x8b, 0xff, 0x20])
 
 @testset "Aqua.jl" begin
     Aqua.test_all(XPostCollector)
@@ -1239,6 +1253,91 @@ end
             @test methods == ["GET"]
         end
     end
+end
+
+@testset "stream rules 2xx responses and safe error bodies" begin
+    with_temp_stream_cfg(task = "stream_rules_201") do cfg, dir
+        with_env_token() do
+            cfg.rule_tag = "stream-rules-201"
+            rule_value = build_query(cfg)
+            server = HTTP.serve!(listenany = true) do req
+                if String(req.method) == "GET"
+                    return HTTP.Response(
+                        200,
+                        ["Content-Type" => "application/json"],
+                        String(JSON3.write(Dict("data" => Any[]))),
+                    )
+                end
+                return HTTP.Response(
+                    201,
+                    ["Content-Type" => "application/json"],
+                    String(
+                        JSON3.write(
+                            Dict(
+                                "data" => Any[
+                                    Dict(
+                                        "id" => "created-201",
+                                        "value" => rule_value,
+                                        "tag" => cfg.rule_tag,
+                                    ),
+                                ],
+                                "meta" => Dict(
+                                    "summary" => Dict(
+                                        "created" => 1,
+                                        "not_created" => 0,
+                                        "valid" => 1,
+                                        "invalid" => 0,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+            end
+            try
+                cfg.api_base_url = "http://127.0.0.1:$(HTTP.port(server))"
+                result = ensure_stream_rule!(
+                    cfg,
+                    ["Authorization" => "Bearer dummy"],
+                    fetch_stream_json_with_retry,
+                )
+                @test result.created == true
+                @test result.id == "created-201"
+            finally
+                close(server)
+            end
+        end
+    end
+
+    gzip_body = gzip_bytes("""{"title":"Payment Required","detail":"upgrade required"}""")
+    gzip_resp = HTTP.Response(402, ["Content-Encoding" => "gzip"], gzip_body)
+    gzip_text = _body_to_text(gzip_resp)
+    @test occursin("Payment Required", gzip_text)
+    @test occursin("upgrade required", gzip_text)
+    gzip_err = try
+        _stream_response_outcome(gzip_resp, "http://x.test"; body = gzip_text)
+        nothing
+    catch e
+        e
+    end
+    @test gzip_err isa XPostCollector.XApiAccessError
+    @test gzip_err.status == 402
+    @test occursin("upgrade required", sprint(showerror, gzip_err))
+
+    bad_resp = HTTP.Response(402, ["Content-Encoding" => "gzip"], UInt8[0x8b, 0xff, 0x00])
+    bad_text = _body_to_text(bad_resp)
+    @test isvalid(bad_text)
+    @test occursin("non-UTF-8 response body", bad_text)
+    bad_err = try
+        _stream_response_outcome(bad_resp, "http://x.test"; body = bad_text)
+        nothing
+    catch e
+        e
+    end
+    @test bad_err isa XPostCollector.XApiAccessError
+    @test bad_err.status == 402
+
+    @test _looks_like_stream_timeout(BinaryShowError()) == false
 end
 
 @testset "stream response and reconnect helpers classify outcomes" begin
