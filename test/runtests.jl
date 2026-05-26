@@ -143,7 +143,13 @@ function write_jsonl_lines(path::String, lines::Vector{String})
     end
 end
 
-gzip_bytes(s::AbstractString) = read(HTTP.GzipCompressorStream(IOBuffer(String(s))))
+function gzip_bytes(s::AbstractString)
+    buf = IOBuffer()
+    gz = HTTP.GzipCompressorStream(buf)
+    write(gz, String(s))
+    close(gz)
+    return take!(buf)
+end
 
 function jsonl_tweet_line(
     id::String;
