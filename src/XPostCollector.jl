@@ -905,22 +905,114 @@ Base.showerror(io::IO, e::FullArchiveAccessError) = print(
 )
 
 function _looks_like_invalid_pagination_token(body::AbstractString)
-    s = lowercase(String(body))
+    s = _ascii_lowercase_text(body)
     return (occursin("next_token", s) || occursin("pagination", s)) &&
            occursin("token", s) &&
            occursin("invalid", s)
 end
 
-function _body_to_text(resp)
+function _ascii_lowercase_text(s::AbstractString)::String
+    out = UInt8[]
+    for b in codeunits(s)
+        if 0x41 <= b <= 0x5a
+            push!(out, b + 0x20)
+        elseif b < 0x80
+            push!(out, b)
+        else
+            push!(out, 0x20)
+        end
+    end
+    return String(out)
+end
+
+function _bytes_to_safe_text(bytes::AbstractVector{UInt8}; fallback_label::AbstractString = "response body")::String
+    raw = Vector{UInt8}(bytes)
+    isempty(raw) && return ""
+    isvalid(String, raw) && return String(copy(raw))
+    n = min(length(raw), 48)
+    hex_io = IOBuffer()
+    for i = 1:n
+        print(hex_io, string(raw[i], base = 16, pad = 2))
+    end
+    hex = String(take!(hex_io))
+    suffix = length(raw) > n ? "..." : ""
+    return "<non-UTF-8 $(fallback_label): $(length(raw)) bytes; hex=$(hex)$(suffix)>"
+end
+
+_bytes_to_safe_text(s::AbstractString; fallback_label::AbstractString = "response body") =
+    _bytes_to_safe_text(Vector{UInt8}(codeunits(s)); fallback_label = fallback_label)
+
+_bytes_to_safe_text(x; fallback_label::AbstractString = "response body") =
+    _bytes_to_safe_text(string(x); fallback_label = fallback_label)
+
+function _safe_showerror_text(e)::String
     try
-        return String(resp.body)
-    catch
-        return "<non-text>"
+        return _bytes_to_safe_text(codeunits(sprint(showerror, e)); fallback_label = "exception")
+    catch err
+        return "<error while rendering exception: $(typeof(err))>"
     end
 end
 
+function _response_body_bytes(resp)
+    try
+        body = resp.body
+        body === HTTP.nobody && return UInt8[]
+        body isa AbstractVector{UInt8} && return Vector{UInt8}(body)
+        body isa AbstractString && return Vector{UInt8}(codeunits(body))
+        return Vector{UInt8}(body)
+    catch
+        return UInt8[]
+    end
+end
+
+function _response_content_encoding(resp)::String
+    try
+        return HTTP.header(resp, "content-encoding")
+    catch
+        return ""
+    end
+end
+
+function _decode_response_body_bytes(resp, raw::Vector{UInt8})::Vector{UInt8}
+    encoding = _ascii_lowercase_text(_response_content_encoding(resp))
+    if occursin("gzip", encoding)
+        try
+            return HTTP.decode(HTTP.Response(resp.status, resp.headers, raw), "gzip")
+        catch
+            return raw
+        end
+    end
+    return raw
+end
+
+function _body_to_text(resp, raw_body = nothing)
+    raw =
+        raw_body === nothing ? _response_body_bytes(resp) :
+        (raw_body isa AbstractVector{UInt8} ? Vector{UInt8}(raw_body) :
+         raw_body isa AbstractString ? Vector{UInt8}(codeunits(raw_body)) :
+         Vector{UInt8}(raw_body))
+    decoded = _decode_response_body_bytes(resp, raw)
+    return _bytes_to_safe_text(decoded)
+end
+
+function _json_response_body(resp)
+    txt = strip(_body_to_text(resp))
+    isempty(txt) && return Dict{String,Any}()
+    return JSON3.read(txt)
+end
+
+function _unwrap_x_api_access_error(e)
+    current = e
+    for _ = 1:8
+        current isa XApiAccessError && return current
+        hasproperty(current, :error) || return nothing
+        current = getproperty(current, :error)
+    end
+    return nothing
+end
+
 function _extract_x_api_error_detail(body::AbstractString)::String
-    txt = strip(String(body))
+    txt = strip(_bytes_to_safe_text(codeunits(String(body))))
     isempty(txt) && return txt
     try
         obj = JSON3.read(txt)
@@ -956,7 +1048,7 @@ function _looks_like_full_archive_access_error(
 )
     status == 403 || return false
     occursin("/2/tweets/search/all", String(url)) || return false
-    s = lowercase(String(body))
+    s = _ascii_lowercase_text(body)
     return occursin("full-archive", s) ||
            occursin("full archive", s) ||
            occursin("enterprise", s) ||
@@ -1304,9 +1396,9 @@ function fetch_stream_json_with_retry(
             continue
         end
 
-        if resp.status == 200
+        if 200 <= resp.status < 300
             try
-                return JSON3.read(String(resp.body))
+                return _json_response_body(resp)
             catch e
                 @warn "Stream rules JSON decode failed" attempt = attempt exception = e
                 sleep(wait_sec + rand() * 0.5)
@@ -1758,12 +1850,18 @@ function _finish_stream_gap!(
     return nothing
 end
 
-function _stream_response_body(http)
+function _stream_response_body(resp, http)
     try
-        return String(read(http))
+        return _body_to_text(resp, read(http))
     catch
         return ""
     end
+end
+
+_stream_response_body(http) = try
+    _bytes_to_safe_text(read(http))
+catch
+    ""
 end
 
 function _throw_stream_response_error(resp, url::AbstractString, body::AbstractString)
@@ -2006,8 +2104,8 @@ function _stream_reconnect_decision(cfg::StreamConfig, reconnects::Int)
 end
 
 function _looks_like_stream_timeout(e)::Bool
-    msg = sprint(showerror, e)
-    return occursin("Timeout", msg) || occursin("timed out", lowercase(msg))
+    msg = _ascii_lowercase_text(_safe_showerror_text(e))
+    return occursin("timeout", msg) || occursin("timed out", msg)
 end
 
 function run_stream_collector(cfg::StreamConfig)
@@ -2085,7 +2183,7 @@ function run_stream_collector(cfg::StreamConfig)
                     if resp.status != 200
                         body =
                             resp.status == 429 || 500 <= resp.status < 600 ? "" :
-                            _stream_response_body(http)
+                            _stream_response_body(resp, http)
                         status_outcome =
                             _stream_response_outcome(resp, url; body = body)
                         if status_outcome.stop_reason == "rate_limited"
@@ -2193,10 +2291,12 @@ function run_stream_collector(cfg::StreamConfig)
                     )
                     _persist_stream_state!(cfg, st)
                     rethrow()
-                elseif e isa XApiAccessError
+                end
+                api_error = _unwrap_x_api_access_error(e)
+                if api_error !== nothing
                     st.stop_reason = "api_error"
-                    st.last_status = e.status
-                    st.last_error = sprint(showerror, e)
+                    st.last_status = api_error.status
+                    st.last_error = _safe_showerror_text(api_error)
                     _finish_stream_gap!(
                         cfg,
                         st,
@@ -2206,7 +2306,7 @@ function run_stream_collector(cfg::StreamConfig)
                         "api_error",
                     )
                     _persist_stream_state!(cfg, st)
-                    rethrow()
+                    throw(api_error)
                 end
 
                 stop_reason = _stream_stop_reason(cfg, st, started_at)
@@ -2232,7 +2332,7 @@ function run_stream_collector(cfg::StreamConfig)
                     st.consecutive_failures = 0
                 end
 
-                error_text = sprint(showerror, e)
+                error_text = _safe_showerror_text(e)
                 reason = _looks_like_stream_timeout(e) ? "idle_timeout" : "stream_error"
                 st.stop_reason = reason
                 st.last_status = 0
