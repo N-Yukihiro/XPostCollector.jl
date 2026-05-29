@@ -1,0 +1,488 @@
+function _stream_line_payload(line::AbstractString)::Union{Nothing,String}
+    s = strip(String(line))
+    isempty(s) && return nothing
+    if startswith(s, "data:")
+        s = strip(s[6:end])
+        isempty(s) && return nothing
+    end
+    s == "[DONE]" && return nothing
+    return s
+end
+
+function _stream_event_meta(obj, received_at::AbstractString, page_new::Int)
+    meta = Dict{String,Any}("received_at" => String(received_at), "result_count" => page_new)
+    _json_haskey(obj, "matching_rules") &&
+        (meta["matching_rules"] = _json_get(obj, "matching_rules", nothing))
+    _json_haskey(obj, "errors") && (meta["errors"] = _json_get(obj, "errors", nothing))
+    _json_haskey(obj, "meta") && (meta["stream_meta"] = _json_get(obj, "meta", nothing))
+    return meta
+end
+
+function _stream_data_items(obj)
+    data = _json_get(obj, "data", nothing)
+    data === nothing && return Any[]
+    if data isa AbstractVector
+        return data
+    end
+    return Any[data]
+end
+
+function handle_stream_line!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    sink,
+    line::AbstractString,
+)::Symbol
+    payload = _stream_line_payload(line)
+    if payload === nothing
+        st.keepalive_count += 1
+        st.last_heartbeat_at = stream_now_utc()
+        return :keepalive
+    end
+
+    obj = try
+        JSON3.read(payload)
+    catch e
+        @warn "Stream JSON parse error (skip)" exception = e line = payload
+        return :invalid
+    end
+
+    new_tweets = Any[]
+    new_ids = String[]
+    if _json_haskey(obj, "data")
+        seen_in_event = Set{String}()
+        for tw in _stream_data_items(obj)
+            tid = safe_str(_json_get(tw, "id", nothing); default = "")
+            isempty(tid) && continue
+            tid in seen_in_event && continue
+            push!(seen_in_event, tid)
+            if !seen_exists(sdb, tid)
+                push!(new_tweets, tw)
+                push!(new_ids, tid)
+            end
+        end
+    end
+
+    if !isempty(new_tweets)
+        DBInterface.execute(sdb.db, "BEGIN;")
+        try
+            seen_at = utc_now_z(lag_seconds = 0)
+            inserted = 0
+            accepted_tweets = Any[]
+            for (tw, tid) in zip(new_tweets, new_ids)
+                if mark_seen!(sdb, tid, seen_at)
+                    push!(accepted_tweets, tw)
+                    inserted += 1
+                end
+            end
+
+            page_new = length(accepted_tweets)
+            if page_new == 0
+                DBInterface.execute(sdb.db, "COMMIT;")
+                return _json_haskey(obj, "errors") ? :errors : :ignored
+            end
+
+            entries = Vector{Tuple{String,Any}}()
+            for tw in accepted_tweets
+                push!(entries, ("tweet", tw))
+            end
+
+            include_count = 0
+            if cfg.write_includes && _json_haskey(obj, "includes")
+                inc = _json_get(obj, "includes", nothing)
+                for (k, arr) in _json_pairs(inc)
+                    kstr = String(k)
+                    for item in _json_items(arr)
+                        push!(entries, ("include:$kstr", item))
+                        include_count += 1
+                    end
+                end
+            end
+
+            received_at = stream_now_utc()
+            push!(
+                entries,
+                (
+                    "page",
+                    Dict(
+                        "page" => st.total_tweets + page_new,
+                        "endpoint" => "stream",
+                        "meta" => _stream_event_meta(obj, received_at, page_new),
+                    ),
+                ),
+            )
+
+            _write_stream_jsonl_entries!(cfg, sink, entries)
+            DBInterface.execute(sdb.db, "COMMIT;")
+            st.total_tweets += page_new
+            st.total_includes += include_count
+            st.seen_count += inserted
+            st.last_event_at = received_at
+        catch e
+            try
+                DBInterface.execute(sdb.db, "ROLLBACK;")
+            catch
+            end
+            rethrow(e)
+        end
+        return :tweet
+    end
+
+    return _json_haskey(obj, "errors") ? :errors : :ignored
+end
+
+function _stream_stop_reason(cfg::StreamConfig, st::StreamState, started_at::Float64)
+    cfg.max_posts > 0 && st.total_tweets >= cfg.max_posts && return "max_posts"
+    cfg.max_seconds > 0 && (time() - started_at) >= cfg.max_seconds && return "max_seconds"
+    return nothing
+end
+
+stream_now_utc() = string(Dates.now(Dates.UTC))
+
+function _refresh_stream_storage_stats!(cfg::StreamConfig, st::StreamState)
+    st.db_path = out_db(cfg)
+    st.db_size_bytes = isfile(st.db_path) ? stat(st.db_path).size : 0
+    return st
+end
+
+function _persist_stream_state!(cfg::StreamConfig, st::StreamState)
+    _refresh_stream_storage_stats!(cfg, st)
+    st.timestamp = stream_now_utc()
+    save_state(out_stream_state(cfg), st)
+    return nothing
+end
+
+function _maybe_persist_stream_state!(
+    cfg::StreamConfig,
+    st::StreamState,
+    last_flush_ref::Base.RefValue{Float64};
+    force::Bool = false,
+)
+    now = time()
+    due =
+        cfg.state_flush_interval_seconds > 0 &&
+        (last_flush_ref[] <= 0 || (now - last_flush_ref[]) >= cfg.state_flush_interval_seconds)
+    if force || due
+        _persist_stream_state!(cfg, st)
+        last_flush_ref[] = now
+    end
+    return nothing
+end
+
+function _write_stream_gap!(
+    cfg::StreamConfig,
+    st::StreamState,
+    start_time_utc::AbstractString,
+    end_time_utc::AbstractString,
+    reason::AbstractString,
+)
+    isempty(start_time_utc) && return nothing
+    mkpath(cfg.out_dir)
+    open(out_stream_gaps(cfg), "a") do io
+        JSON3.write(
+            io,
+            Dict(
+                "task_name" => st.task_name,
+                "query" => st.query,
+                "rule_id" => st.rule_id,
+                "rule_tag" => st.rule_tag,
+                "start_time_utc" => String(start_time_utc),
+                "end_time_utc" => String(end_time_utc),
+                "reason" => String(reason),
+                "recorded_at" => stream_now_utc(),
+            ),
+        )
+        write(io, '\n')
+        flush(io)
+        cfg.durable_writes && _maybe_fsync(io)
+    end
+    return nothing
+end
+
+function _begin_stream_gap!(
+    st::StreamState,
+    pending_gap_start::Base.RefValue{Union{Nothing,String}},
+    pending_gap_reason::Base.RefValue{String},
+    reason::AbstractString,
+)
+    disconnected_at = stream_now_utc()
+    st.last_disconnect_at = disconnected_at
+    pending_gap_start[] === nothing && (pending_gap_start[] = disconnected_at)
+    isempty(pending_gap_reason[]) && (pending_gap_reason[] = String(reason))
+    return disconnected_at
+end
+
+function _finish_stream_gap!(
+    cfg::StreamConfig,
+    st::StreamState,
+    pending_gap_start::Base.RefValue{Union{Nothing,String}},
+    pending_gap_reason::Base.RefValue{String},
+    end_time_utc::AbstractString,
+    reason::AbstractString = pending_gap_reason[],
+)
+    pending_gap_start[] === nothing && return nothing
+    gap_reason = isempty(reason) ? "disconnected" : String(reason)
+    _write_stream_gap!(cfg, st, pending_gap_start[]::String, end_time_utc, gap_reason)
+    pending_gap_start[] = nothing
+    pending_gap_reason[] = ""
+    return nothing
+end
+
+function _stream_response_body(resp, http)
+    try
+        return _body_to_text(resp, read(http))
+    catch
+        return ""
+    end
+end
+
+_stream_response_body(http) = try
+    _bytes_to_safe_text(read(http))
+catch
+    ""
+end
+
+function _throw_stream_response_error(resp, url::AbstractString, body::AbstractString)
+    body_text = _extract_x_api_error_detail(body)
+    throw(XApiAccessError(resp.status, String(url), body_text))
+end
+
+function _stream_response_outcome(resp, url::AbstractString; body::AbstractString = "")
+    resp.status == 200 &&
+        return (
+            kind = :ok,
+            stop_reason = "",
+            sleep_seconds = 0,
+            activity = false,
+            status = 200,
+            error = "",
+        )
+    if resp.status == 429
+        return (
+            kind = :retryable,
+            stop_reason = "rate_limited",
+            sleep_seconds = rate_limit_sleep_seconds(resp),
+            activity = false,
+            status = resp.status,
+            error = "rate limited",
+        )
+    elseif 500 <= resp.status < 600
+        return (
+            kind = :retryable,
+            stop_reason = "server_error",
+            sleep_seconds = 0,
+            activity = false,
+            status = resp.status,
+            error = "server error",
+        )
+    end
+    _throw_stream_response_error(resp, url, body)
+end
+
+function _record_stream_line!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    sink,
+    line::AbstractString,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64} = Ref(time()),
+)
+    result = handle_stream_line!(cfg, st, sdb, sink, line)
+    if result != :invalid
+        activity_ref[] = true
+        st.consecutive_failures = 0
+        st.stop_reason = ""
+    end
+    force_state = result in (:tweet, :errors)
+    _maybe_persist_stream_state!(cfg, st, state_flush_ref; force = force_state)
+
+    stop_reason = _stream_stop_reason(cfg, st, started_at)
+    if stop_reason !== nothing
+        st.completed = true
+        st.stop_reason = stop_reason
+        _persist_stream_state!(cfg, st)
+        state_flush_ref[] = time()
+    end
+    return (result = result, stop_reason = stop_reason)
+end
+
+function _process_stream_chunk!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    sink,
+    pending_line::IOBuffer,
+    chunk,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64} = Ref(time()),
+)
+    for b in chunk
+        if b == UInt8('\n')
+            line = String(take!(pending_line))
+            res = _record_stream_line!(
+                cfg,
+                st,
+                sdb,
+                sink,
+                line,
+                started_at,
+                activity_ref,
+                state_flush_ref,
+            )
+            res.stop_reason !== nothing && return res
+        else
+            write(pending_line, b)
+        end
+    end
+    return (result = :pending, stop_reason = nothing)
+end
+
+function _flush_pending_stream_line!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    sink,
+    pending_line::IOBuffer,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64} = Ref(time()),
+)
+    position(pending_line) == 0 && return (result = :empty, stop_reason = nothing)
+    line = String(take!(pending_line))
+    return _record_stream_line!(
+        cfg,
+        st,
+        sdb,
+        sink,
+        line,
+        started_at,
+        activity_ref,
+        state_flush_ref,
+    )
+end
+
+_stream_completed_outcome(stop_reason::AbstractString, activity_ref::Base.RefValue{Bool}) = (
+    kind = :completed,
+    stop_reason = String(stop_reason),
+    sleep_seconds = 0,
+    activity = activity_ref[],
+    status = 0,
+    error = "",
+)
+
+_stream_disconnected_outcome(activity_ref::Base.RefValue{Bool}) = (
+    kind = :disconnected,
+    stop_reason = "disconnected",
+    sleep_seconds = 0,
+    activity = activity_ref[],
+    status = 0,
+    error = "",
+)
+
+function _flush_pending_stream_outcome!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    sink,
+    pending_line::IOBuffer,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64} = Ref(time()),
+)
+    res = _flush_pending_stream_line!(
+        cfg,
+        st,
+        sdb,
+        sink,
+        pending_line,
+        started_at,
+        activity_ref,
+        state_flush_ref,
+    )
+    res.stop_reason !== nothing &&
+        return _stream_completed_outcome(res.stop_reason, activity_ref)
+    return nothing
+end
+
+function _read_stream_lines!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    sink,
+    http,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64} = Ref(time()),
+)
+    pending_line = IOBuffer()
+    try
+        while true
+            chunk = readavailable(http)
+            if isempty(chunk)
+                outcome = _flush_pending_stream_outcome!(
+                    cfg,
+                    st,
+                    sdb,
+                    sink,
+                    pending_line,
+                    started_at,
+                    activity_ref,
+                    state_flush_ref,
+                )
+                outcome !== nothing && return outcome
+                return _stream_disconnected_outcome(activity_ref)
+            end
+            res = _process_stream_chunk!(
+                cfg,
+                st,
+                sdb,
+                sink,
+                pending_line,
+                chunk,
+                started_at,
+                activity_ref,
+                state_flush_ref,
+            )
+            if res.stop_reason !== nothing
+                return _stream_completed_outcome(res.stop_reason, activity_ref)
+            end
+        end
+    catch e
+        outcome = _flush_pending_stream_outcome!(
+            cfg,
+            st,
+            sdb,
+            sink,
+            pending_line,
+            started_at,
+            activity_ref,
+            state_flush_ref,
+        )
+        outcome !== nothing && return outcome
+        rethrow(e)
+    end
+end
+
+function _stream_reconnect_decision(cfg::StreamConfig, reconnects::Int)
+    if !cfg.reconnect
+        return (should_reconnect = false, reconnects = reconnects, stop_reason = "")
+    end
+    next_reconnects = reconnects + 1
+    if cfg.max_reconnects > 0 && next_reconnects > cfg.max_reconnects
+        return (
+            should_reconnect = false,
+            reconnects = next_reconnects,
+            stop_reason = "max_reconnects_exceeded",
+        )
+    end
+    return (should_reconnect = true, reconnects = next_reconnects, stop_reason = "")
+end
+
+function _looks_like_stream_timeout(e)::Bool
+    msg = _ascii_lowercase_text(_safe_showerror_text(e))
+    return occursin("timeout", msg) || occursin("timed out", msg)
+end
