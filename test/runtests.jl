@@ -532,12 +532,23 @@ end
             convert_outputs(cfg)
             @test count_arrow_rows(arrp) == 2
 
-            write_jsonl_lines(jsonl, [jsonl_tweet_line("new1"), jsonl_page_line(2)])
+            write_jsonl_lines(
+                jsonl,
+                [
+                    jsonl_tweet_line("new1"),
+                    jsonl_tweet_line("new2"),
+                    jsonl_page_line(2),
+                    jsonl_tweet_line("new3"),
+                    jsonl_page_line(3),
+                ],
+            )
 
             cfg.arrow_append = false
             convert_outputs(cfg)
 
-            @test count_arrow_rows(arrp) == 1
+            @test count_arrow_rows(arrp) == 3
+            rows = collect(Tables.rows(Arrow.Table(IOBuffer(read(arrp)))))
+            @test [String(r.tweet_id) for r in rows] == ["new1", "new2", "new3"]
         end
     end
 end

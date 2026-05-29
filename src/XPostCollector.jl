@@ -3180,11 +3180,6 @@ function _is_active_partial_jsonl_error(
     return _looks_like_json_unexpected_eof(e)
 end
 
-function write_csv_batch!(cfg::SearchConfig, batch::Vector{TweetRow})
-    isempty(batch) && return
-    CSV.write(out_csv(cfg), batch; append = isfile(out_csv(cfg)))
-end
-
 # ★ 追加: Arrow append の “stream format only” を安全復旧
 function _arrow_append_safe!(path::String, batch)
     try
@@ -3206,23 +3201,6 @@ function _arrow_append_safe!(path::String, batch)
             return
         end
         rethrow()
-    end
-end
-
-function write_arrow_batch!(cfg::SearchConfig, batch::Vector{TweetRow})
-    isempty(batch) && return
-    apath = out_arrow(cfg)
-
-    if cfg.arrow_append
-        if !isfile(apath)
-            # append 前提なので stream 形式で作る
-            Arrow.write(apath, batch; file = false)
-        else
-            _arrow_append_safe!(apath, batch)
-        end
-    else
-        rm(apath; force = true)
-        Arrow.write(apath, batch)  # file 形式
     end
 end
 
@@ -3283,24 +3261,26 @@ function _convert_flat_outputs_from_jsonl_paths(
     # page マーカーが無い古いJSONL用の安全弁
     MAX_PENDING_WITHOUT_PAGE = 50_000
 
+    function write_arrow_flat_batch!()
+        if !wrote_arrow
+            if cfg.arrow_append && isfile(arrow_path)
+                _arrow_append_safe!(String(arrow_path), batch)
+            else
+                !cfg.arrow_append && isfile(arrow_path) && rm(arrow_path; force = true)
+                Arrow.write(arrow_path, batch; file = false)
+            end
+        else
+            _arrow_append_safe!(String(arrow_path), batch)
+        end
+        wrote_arrow = true
+    end
+
     function write_batch_if_full!()
         if length(batch) < cfg.convert_batch_size
             return
         end
         cfg.emit_csv && CSV.write(csv_path, batch; append = isfile(csv_path))
-        if cfg.emit_arrow
-            if cfg.arrow_append
-                if !isfile(arrow_path)
-                    Arrow.write(arrow_path, batch; file = false)
-                else
-                    _arrow_append_safe!(String(arrow_path), batch)
-                end
-            else
-                rm(arrow_path; force = true)
-                Arrow.write(arrow_path, batch)
-            end
-            wrote_arrow = true
-        end
+        cfg.emit_arrow && write_arrow_flat_batch!()
         empty!(batch)
     end
 
@@ -3419,19 +3399,7 @@ function _convert_flat_outputs_from_jsonl_paths(
 
     if !isempty(batch)
         cfg.emit_csv && CSV.write(csv_path, batch; append = isfile(csv_path))
-        if cfg.emit_arrow
-            if cfg.arrow_append
-                if !isfile(arrow_path)
-                    Arrow.write(arrow_path, batch; file = false)
-                else
-                    _arrow_append_safe!(String(arrow_path), batch)
-                end
-            else
-                rm(arrow_path; force = true)
-                Arrow.write(arrow_path, batch)
-            end
-            wrote_arrow = true
-        end
+        cfg.emit_arrow && write_arrow_flat_batch!()
         empty!(batch)
     end
 
@@ -3497,348 +3465,6 @@ out_state_wide(cfg::StreamConfig) =
     joinpath(cfg.out_dir, "$(cfg.task_name).wide.state.json")
 out_csv_wide(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).wide.csv")
 out_arrow_wide(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).wide.arrow")
-
-wide_maybe_str(x) = begin
-    s = safe_str(x; default = "")
-    isempty(s) ? missing : s
-end
-wide_join_str(xs::Vector{String}, sep::AbstractString) =
-    isempty(xs) ? missing : join(xs, sep)
-wide_json_str(x) = begin
-    isnull(x) && return missing
-    try
-        String(JSON3.write(x))
-    catch
-        missing
-    end
-end
-wide_getv(obj, key, default = nothing) = _json_get(obj, String(key), default)
-
-function wide_author_cols(author_id::AbstractString, users::Dict{String,Any})
-    u = get(users, author_id, nothing)
-    if u === nothing
-        return (
-            author_username = missing,
-            author_name = missing,
-            author_created_at = missing,
-            author_location = missing,
-            author_verified = missing,
-            author_protected = missing,
-            author_description = missing,
-            author_profile_image_url = missing,
-            author_followers_count = missing,
-            author_following_count = missing,
-            author_tweet_count = missing,
-            author_listed_count = missing,
-            author_like_count = missing,
-            author_media_count = missing,
-            author_user_json = missing,
-        )
-    end
-    pm = wide_getv(u, "public_metrics", nothing)
-    return (
-        author_username = wide_maybe_str(wide_getv(u, "username", nothing)),
-        author_name = wide_maybe_str(wide_getv(u, "name", nothing)),
-        author_created_at = wide_maybe_str(wide_getv(u, "created_at", nothing)),
-        author_location = wide_maybe_str(wide_getv(u, "location", nothing)),
-        author_verified = safe_bool(wide_getv(u, "verified", nothing)),
-        author_protected = safe_bool(wide_getv(u, "protected", nothing)),
-        author_description = wide_maybe_str(wide_getv(u, "description", nothing)),
-        author_profile_image_url = wide_maybe_str(
-            wide_getv(u, "profile_image_url", nothing),
-        ),
-        author_followers_count = pm === nothing ? missing :
-                                 safe_int(wide_getv(pm, "followers_count", nothing)),
-        author_following_count = pm === nothing ? missing :
-                                 safe_int(wide_getv(pm, "following_count", nothing)),
-        author_tweet_count = pm === nothing ? missing :
-                             safe_int(wide_getv(pm, "tweet_count", nothing)),
-        author_listed_count = pm === nothing ? missing :
-                              safe_int(wide_getv(pm, "listed_count", nothing)),
-        author_like_count = pm === nothing ? missing :
-                            safe_int(wide_getv(pm, "like_count", nothing)),
-        author_media_count = pm === nothing ? missing :
-                             safe_int(wide_getv(pm, "media_count", nothing)),
-        author_user_json = wide_json_str(u),
-    )
-end
-
-function wide_mention_cols(tdata, users::Dict{String,Any}; sep::AbstractString = ";")
-    ents = wide_getv(tdata, "entities", nothing)
-    mentions = ents === nothing ? nothing : wide_getv(ents, "mentions", nothing)
-    mentions === nothing && return (
-        mention_usernames = missing,
-        mention_ids = missing,
-        mention_names = missing,
-        mentioned_users_json = missing,
-    )
-
-    ids = String[]
-    usernames = String[]
-    names = String[]
-    mentioned_objs = Any[]
-    for m in mentions
-        push!(mentioned_objs, m)
-        mid = safe_str(wide_getv(m, "id", nothing); default = "")
-        muser = safe_str(wide_getv(m, "username", nothing); default = "")
-        !isempty(mid) && push!(ids, mid)
-        !isempty(muser) && push!(usernames, muser)
-        u = (!isempty(mid) ? get(users, mid, nothing) : nothing)
-        nm = u === nothing ? "" : safe_str(wide_getv(u, "name", nothing); default = "")
-        !isempty(nm) && push!(names, nm)
-    end
-
-    return (
-        mention_usernames = wide_join_str(usernames, sep),
-        mention_ids = wide_join_str(ids, sep),
-        mention_names = wide_join_str(names, sep),
-        mentioned_users_json = isempty(mentioned_objs) ? missing :
-                               wide_json_str(mentioned_objs),
-    )
-end
-
-function wide_media_cols(tdata, media::Dict{String,Any}; sep::AbstractString = ";")
-    at = wide_getv(tdata, "attachments", nothing)
-    keys = at === nothing ? nothing : wide_getv(at, "media_keys", nothing)
-    keys === nothing && return (
-        media_keys = missing,
-        media_urls = missing,
-        media_types = missing,
-        media_widths = missing,
-        media_heights = missing,
-        media_json = missing,
-    )
-
-    mkeys = String[]
-    urls = String[]
-    types = String[]
-    widths = String[]
-    heights = String[]
-    mfull = Any[]
-    for k in keys
-        mk = safe_str(k; default = "")
-        isempty(mk) && continue
-        push!(mkeys, mk)
-        m = get(media, mk, nothing)
-        if m !== nothing
-            push!(mfull, m)
-            url = safe_str(wide_getv(m, "url", nothing); default = "")
-            isempty(url) &&
-                (url = safe_str(wide_getv(m, "preview_image_url", nothing); default = ""))
-            typ = safe_str(wide_getv(m, "type", nothing); default = "")
-            w = safe_str(wide_getv(m, "width", nothing); default = "")
-            h = safe_str(wide_getv(m, "height", nothing); default = "")
-            !isempty(url) && push!(urls, url)
-            !isempty(typ) && push!(types, typ)
-            !isempty(w) && push!(widths, w)
-            !isempty(h) && push!(heights, h)
-        end
-    end
-
-    return (
-        media_keys = wide_join_str(mkeys, sep),
-        media_urls = isempty(urls) ? missing : join(urls, sep),
-        media_types = isempty(types) ? missing : join(types, sep),
-        media_widths = isempty(widths) ? missing : join(widths, sep),
-        media_heights = isempty(heights) ? missing : join(heights, sep),
-        media_json = isempty(mfull) ? missing : wide_json_str(mfull),
-    )
-end
-
-function wide_place_cols(place_id::AbstractString, places::Dict{String,Any})
-    p = get(places, place_id, nothing)
-    if p === nothing
-        return (
-            place_id = isempty(place_id) ? missing : place_id,
-            place_full_name = missing,
-            place_name = missing,
-            place_country = missing,
-            place_country_code = missing,
-            place_type = missing,
-            place_geo_json = missing,
-            place_json = missing,
-        )
-    end
-    geo = wide_getv(p, "geo", nothing)
-    return (
-        place_id = isempty(place_id) ? missing : place_id,
-        place_full_name = wide_maybe_str(wide_getv(p, "full_name", nothing)),
-        place_name = wide_maybe_str(wide_getv(p, "name", nothing)),
-        place_country = wide_maybe_str(wide_getv(p, "country", nothing)),
-        place_country_code = wide_maybe_str(wide_getv(p, "country_code", nothing)),
-        place_type = wide_maybe_str(wide_getv(p, "place_type", nothing)),
-        place_geo_json = geo === nothing ? missing : wide_json_str(geo),
-        place_json = wide_json_str(p),
-    )
-end
-
-function wide_referenced_tweets_cols(
-    rts,
-    tweets::Dict{String,Any};
-    sep::AbstractString = ";",
-)
-    rts === nothing && return (
-        referenced_included_texts = missing,
-        referenced_included_author_ids = missing,
-        referenced_included_created_ats = missing,
-        referenced_included_langs = missing,
-        referenced_included_json = missing,
-    )
-
-    texts = String[]
-    author_ids = String[]
-    created_ats = String[]
-    langs = String[]
-    hit_objs = Any[]
-    for r in rts
-        rid = safe_str(wide_getv(r, "id", nothing); default = "")
-        isempty(rid) && continue
-        t = get(tweets, rid, nothing)
-        t === nothing && continue
-        push!(hit_objs, t)
-        txt = safe_str(wide_getv(t, "text", nothing); default = "")
-        aid = safe_str(wide_getv(t, "author_id", nothing); default = "")
-        cat = safe_str(wide_getv(t, "created_at", nothing); default = "")
-        lg = safe_str(wide_getv(t, "lang", nothing); default = "")
-        !isempty(txt) && push!(texts, txt)
-        !isempty(aid) && push!(author_ids, aid)
-        !isempty(cat) && push!(created_ats, cat)
-        !isempty(lg) && push!(langs, lg)
-    end
-
-    return (
-        referenced_included_texts = isempty(texts) ? missing : join(texts, sep),
-        referenced_included_author_ids = isempty(author_ids) ? missing :
-                                         join(author_ids, sep),
-        referenced_included_created_ats = isempty(created_ats) ? missing :
-                                          join(created_ats, sep),
-        referenced_included_langs = isempty(langs) ? missing : join(langs, sep),
-        referenced_included_json = isempty(hit_objs) ? missing : wide_json_str(hit_objs),
-    )
-end
-
-function tweet_to_row_wide(
-    tdata;
-    sep::AbstractString = ";",
-    users::Dict{String,Any} = Dict{String,Any}(),
-    media::Dict{String,Any} = Dict{String,Any}(),
-    places::Dict{String,Any} = Dict{String,Any}(),
-    included_tweets::Dict{String,Any} = Dict{String,Any}(),
-)
-    id = safe_str(wide_getv(tdata, "id", nothing); default = "")
-    author_id = safe_str(wide_getv(tdata, "author_id", nothing); default = "")
-    created_at = safe_str(wide_getv(tdata, "created_at", nothing); default = "")
-    lang = safe_str(wide_getv(tdata, "lang", nothing); default = "")
-    text = safe_str(wide_getv(tdata, "text", nothing); default = "")
-    conversation_id = safe_str(wide_getv(tdata, "conversation_id", nothing); default = "")
-    in_reply_to_user_id =
-        safe_str(wide_getv(tdata, "in_reply_to_user_id", nothing); default = "")
-    source = safe_str(wide_getv(tdata, "source", nothing); default = "")
-    reply_settings = safe_str(wide_getv(tdata, "reply_settings", nothing); default = "")
-    possibly_sensitive = safe_bool(wide_getv(tdata, "possibly_sensitive", nothing))
-
-    pm = wide_getv(tdata, "public_metrics", nothing)
-    retweet_count =
-        pm === nothing ? missing : safe_int(wide_getv(pm, "retweet_count", nothing))
-    reply_count = pm === nothing ? missing : safe_int(wide_getv(pm, "reply_count", nothing))
-    like_count = pm === nothing ? missing : safe_int(wide_getv(pm, "like_count", nothing))
-    quote_count = pm === nothing ? missing : safe_int(wide_getv(pm, "quote_count", nothing))
-    bookmark_count =
-        pm === nothing ? missing : safe_int(wide_getv(pm, "bookmark_count", nothing))
-    impression_count =
-        pm === nothing ? missing : safe_int(wide_getv(pm, "impression_count", nothing))
-
-    geo = wide_getv(tdata, "geo", nothing)
-    place_id =
-        geo === nothing ? "" : safe_str(wide_getv(geo, "place_id", nothing); default = "")
-
-    ents = wide_getv(tdata, "entities", nothing)
-    hashtags = String[]
-    urls_expanded = String[]
-    urls_unwound = String[]
-    annotations_text = String[]
-
-    if ents !== nothing
-        hs = wide_getv(ents, "hashtags", nothing)
-        if hs !== nothing
-            for h in hs
-                tag = safe_str(wide_getv(h, "tag", nothing); default = "")
-                !isempty(tag) && push!(hashtags, tag)
-            end
-        end
-        us = wide_getv(ents, "urls", nothing)
-        if us !== nothing
-            for u in us
-                ex = safe_str(wide_getv(u, "expanded_url", nothing); default = "")
-                uw = safe_str(wide_getv(u, "unwound_url", nothing); default = "")
-                !isempty(ex) && push!(urls_expanded, ex)
-                !isempty(uw) && push!(urls_unwound, uw)
-            end
-        end
-        ann = wide_getv(ents, "annotations", nothing)
-        if ann !== nothing
-            for a in ann
-                nt = safe_str(wide_getv(a, "normalized_text", nothing); default = "")
-                ty = safe_str(wide_getv(a, "type", nothing); default = "")
-                if !isempty(nt)
-                    isempty(ty) ? push!(annotations_text, nt) :
-                    push!(annotations_text, string(ty, ":", nt))
-                end
-            end
-        end
-    end
-
-    rts = wide_getv(tdata, "referenced_tweets", nothing)
-    ref_types = String[]
-    ref_ids = String[]
-    if rts !== nothing
-        for r in rts
-            ty = safe_str(wide_getv(r, "type", nothing); default = "")
-            rid = safe_str(wide_getv(r, "id", nothing); default = "")
-            !isempty(ty) && push!(ref_types, ty)
-            !isempty(rid) && push!(ref_ids, rid)
-        end
-    end
-
-    base = (
-        id = isempty(id) ? missing : id,
-        author_id = isempty(author_id) ? missing : author_id,
-        created_at = isempty(created_at) ? missing : created_at,
-        lang = isempty(lang) ? missing : lang,
-        text = isempty(text) ? missing : text,
-        conversation_id = isempty(conversation_id) ? missing : conversation_id,
-        in_reply_to_user_id = isempty(in_reply_to_user_id) ? missing : in_reply_to_user_id,
-        source = isempty(source) ? missing : source,
-        reply_settings = isempty(reply_settings) ? missing : reply_settings,
-        possibly_sensitive = possibly_sensitive,
-        retweet_count = retweet_count,
-        reply_count = reply_count,
-        like_count = like_count,
-        quote_count = quote_count,
-        bookmark_count = bookmark_count,
-        impression_count = impression_count,
-        hashtags = wide_join_str(hashtags, sep),
-        urls_expanded = wide_join_str(urls_expanded, sep),
-        urls_unwound = wide_join_str(urls_unwound, sep),
-        annotations = wide_join_str(annotations_text, sep),
-        referenced_tweet_types = wide_join_str(ref_types, sep),
-        referenced_tweet_ids = wide_join_str(ref_ids, sep),
-        entities_json = ents === nothing ? missing : wide_json_str(ents),
-        public_metrics_json = pm === nothing ? missing : wide_json_str(pm),
-        referenced_tweets_json = rts === nothing ? missing : wide_json_str(rts),
-        geo_json = geo === nothing ? missing : wide_json_str(geo),
-    )
-
-    aid = isempty(author_id) ? "" : author_id
-    return merge(
-        base,
-        wide_author_cols(aid, users),
-        wide_mention_cols(tdata, users; sep = sep),
-        wide_media_cols(tdata, media; sep = sep),
-        wide_place_cols(place_id, places),
-        wide_referenced_tweets_cols(rts, included_tweets; sep = sep),
-    )
-end
 
 function _convert_outputs_wide_from_jsonl_paths(
     cfg::SearchConfig,
