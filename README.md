@@ -7,8 +7,8 @@
 
 XPostCollector.jl collects posts from the X API v2 search endpoints and filtered
 stream endpoint. It stores raw JSONL safely, keeps state for resumable runs,
-deduplicates collected posts with SQLite, and converts outputs to compact CSV,
-wide CSV, and optionally Arrow files.
+deduplicates collected posts with SQLite, and converts outputs to fixed-schema
+flat CSV and optionally Arrow files.
 
 ## Setup
 
@@ -99,12 +99,17 @@ Both REST and streaming collectors write JSONL first. Convert the collected JSON
 to analysis-friendly files with the same functions:
 
 ```julia
-convert_outputs(cfg)       # compact CSV, and Arrow if enabled
-convert_outputs_wide(cfg)  # CSV with joined includes such as users/media/places
+convert_outputs(cfg)       # fixed flat CSV, and Arrow if enabled
+convert_outputs_wide(cfg)  # compatibility wrapper writing the same schema
 ```
 
 For stream configs, conversion includes rotated JSONL files named
 `task_name.rot-*.jsonl` as well as the active `task_name.jsonl` file.
+Converted rows contain only `kind:"tweet"` records. Include records are used as
+lookup data for author, media, place, and retweeted-original columns. Metrics
+without a prefix belong to the current tweet; `original_*` columns are populated
+only from `referenced_tweets.type == "retweeted"` targets when the included
+original tweet is available.
 
 Typical files are:
 
@@ -113,9 +118,10 @@ Typical files are:
 - `task_name.stream.state.json`: filtered stream state.
 - `task_name.stream.gaps.jsonl`: recorded stream disconnect windows.
 - `task_name.seen.sqlite`: SQLite database used for deduplication.
-- `task_name.csv`: compact converted rows.
-- `task_name.wide.csv`: wider converted rows with joined include data.
-- `task_name.arrow` and `task_name.wide.arrow`: optional Arrow outputs.
+- `task_name.csv`: fixed flat converted rows.
+- `task_name.wide.csv`: same fixed flat schema, kept for compatibility.
+- `task_name.arrow` and `task_name.wide.arrow`: optional Arrow outputs with the
+  same column schema as their CSV counterparts.
 - `task_name.rot-*.jsonl`: rotated stream JSONL files.
 
 ## Citing

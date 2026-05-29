@@ -2666,57 +2666,442 @@ function run_collector(cfg::SearchConfig)
 end
 
 # =========================================================
-# 変換（CSV + Arrow）: 12列版
+# 変換（CSV + Arrow）: 固定列の横長1表
 # =========================================================
+const MaybeString = Union{Missing,String}
+const MaybeBool = Union{Missing,Bool}
+const MaybeInt = Union{Missing,Int}
+
+const TWEET_ROW_NAMES = (
+    :tweet_id,
+    :created_at,
+    :author_id,
+    :author_username,
+    :author_name,
+    :lang,
+    :text,
+    :possibly_sensitive,
+    :reply_settings,
+    :source,
+    :conversation_id,
+    :in_reply_to_user_id,
+    :is_retweet,
+    :is_quote,
+    :is_reply,
+    :referenced_tweet_types,
+    :referenced_tweet_ids,
+    :original_tweet_id,
+    :original_author_id,
+    :original_created_at,
+    :original_lang,
+    :original_text,
+    :retweet_count,
+    :reply_count,
+    :like_count,
+    :quote_count,
+    :bookmark_count,
+    :impression_count,
+    :original_retweet_count,
+    :original_reply_count,
+    :original_like_count,
+    :original_quote_count,
+    :original_bookmark_count,
+    :original_impression_count,
+    :mention_usernames,
+    :mention_ids,
+    :mention_names,
+    :hashtags,
+    :urls,
+    :expanded_urls,
+    :unwound_urls,
+    :context_domain_names,
+    :context_entity_names,
+    :media_keys,
+    :media_types,
+    :media_urls,
+    :media_preview_image_urls,
+    :media_widths,
+    :media_heights,
+    :media_duration_ms,
+    :media_view_counts,
+    :place_id,
+    :place_full_name,
+    :place_country_code,
+    :author_created_at,
+    :author_location,
+    :author_verified,
+    :author_protected,
+    :author_followers_count,
+    :author_following_count,
+    :author_tweet_count,
+    :author_listed_count,
+    :author_like_count,
+    :author_media_count,
+    :edit_history_tweet_ids,
+    :is_edit_eligible,
+    :editable_until,
+    :edits_remaining,
+    :entities_json,
+    :context_annotations_json,
+    :referenced_tweets_json,
+    :attachments_json,
+    :public_metrics_json,
+    :original_public_metrics_json,
+    :author_user_json,
+    :media_json,
+    :place_json,
+)
+
 const TweetRow = NamedTuple{
-    (
-        :id,
-        :created_at,
-        :author_id,
-        :lang,
-        :possibly_sensitive,
-        :like_count,
-        :retweet_count,
-        :reply_count,
-        :quote_count,
-        :bookmark_count,
-        :impression_count,
-        :text,
-    ),
+    TWEET_ROW_NAMES,
     Tuple{
-        String,
-        String,
-        String,
-        String,
-        Union{Missing,Bool},
-        Union{Missing,Int},
-        Union{Missing,Int},
-        Union{Missing,Int},
-        Union{Missing,Int},
-        Union{Missing,Int},
-        Union{Missing,Int},
-        String,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeBool,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        Bool,
+        Bool,
+        Bool,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeBool,
+        MaybeBool,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeInt,
+        MaybeString,
+        MaybeBool,
+        MaybeString,
+        MaybeInt,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
+        MaybeString,
     },
 }
 
-function tweet_to_row(tw)::TweetRow
-    pm = _json_get(tw, "public_metrics", nothing)
+flat_maybe_str(x) = begin
+    s = safe_str(x; default = "")
+    isempty(s) ? missing : s
+end
+
+flat_join_str(xs::Vector{String}, sep::AbstractString) =
+    isempty(xs) ? missing : join(xs, sep)
+
+flat_json_str(x) = begin
+    isnull(x) && return missing
+    try
+        String(JSON3.write(x))
+    catch
+        missing
+    end
+end
+
+flat_getv(obj, key, default = nothing) = _json_get(obj, String(key), default)
+
+function _metric(pm, key::AbstractString)
+    pm === nothing && return missing
+    return safe_int(flat_getv(pm, key, nothing))
+end
+
+function tweet_to_row(
+    tdata;
+    sep::AbstractString = ";",
+    users::Dict{String,Any} = Dict{String,Any}(),
+    media::Dict{String,Any} = Dict{String,Any}(),
+    places::Dict{String,Any} = Dict{String,Any}(),
+    included_tweets::Dict{String,Any} = Dict{String,Any}(),
+)::TweetRow
+    tweet_id = safe_str(flat_getv(tdata, "id", nothing); default = "")
+    author_id = safe_str(flat_getv(tdata, "author_id", nothing); default = "")
+    created_at = safe_str(flat_getv(tdata, "created_at", nothing); default = "")
+    lang = safe_str(flat_getv(tdata, "lang", nothing); default = "")
+    text = safe_str(flat_getv(tdata, "text", nothing); default = "")
+    reply_settings = safe_str(flat_getv(tdata, "reply_settings", nothing); default = "")
+    source = safe_str(flat_getv(tdata, "source", nothing); default = "")
+    conversation_id = safe_str(flat_getv(tdata, "conversation_id", nothing); default = "")
+    in_reply_to_user_id =
+        safe_str(flat_getv(tdata, "in_reply_to_user_id", nothing); default = "")
+
+    pm = flat_getv(tdata, "public_metrics", nothing)
+    ents = flat_getv(tdata, "entities", nothing)
+    rts = flat_getv(tdata, "referenced_tweets", nothing)
+    attachments = flat_getv(tdata, "attachments", nothing)
+    context_annotations = flat_getv(tdata, "context_annotations", nothing)
+    edit_controls = flat_getv(tdata, "edit_controls", nothing)
+
+    ref_types = String[]
+    ref_ids = String[]
+    original_tweet_id = ""
+    if rts !== nothing
+        for r in rts
+            ty = safe_str(flat_getv(r, "type", nothing); default = "")
+            rid = safe_str(flat_getv(r, "id", nothing); default = "")
+            !isempty(ty) && push!(ref_types, ty)
+            !isempty(rid) && push!(ref_ids, rid)
+            if ty == "retweeted" && isempty(original_tweet_id)
+                original_tweet_id = rid
+            end
+        end
+    end
+    is_retweet = any(==("retweeted"), ref_types)
+    is_quote = any(==("quoted"), ref_types)
+    is_reply = any(==("replied_to"), ref_types)
+
+    original = isempty(original_tweet_id) ? nothing : get(included_tweets, original_tweet_id, nothing)
+    original_pm = original === nothing ? nothing : flat_getv(original, "public_metrics", nothing)
+
+    mention_usernames = String[]
+    mention_ids = String[]
+    mention_names = String[]
+    hashtags = String[]
+    urls = String[]
+    expanded_urls = String[]
+    unwound_urls = String[]
+
+    if ents !== nothing
+        mentions = flat_getv(ents, "mentions", nothing)
+        if mentions !== nothing
+            for m in mentions
+                mid = safe_str(flat_getv(m, "id", nothing); default = "")
+                username = safe_str(flat_getv(m, "username", nothing); default = "")
+                !isempty(mid) && push!(mention_ids, mid)
+                !isempty(username) && push!(mention_usernames, username)
+                u = isempty(mid) ? nothing : get(users, mid, nothing)
+                nm = u === nothing ? "" : safe_str(flat_getv(u, "name", nothing); default = "")
+                !isempty(nm) && push!(mention_names, nm)
+            end
+        end
+
+        hs = flat_getv(ents, "hashtags", nothing)
+        if hs !== nothing
+            for h in hs
+                tag = safe_str(flat_getv(h, "tag", nothing); default = "")
+                !isempty(tag) && push!(hashtags, tag)
+            end
+        end
+
+        us = flat_getv(ents, "urls", nothing)
+        if us !== nothing
+            for u in us
+                url = safe_str(flat_getv(u, "url", nothing); default = "")
+                ex = safe_str(flat_getv(u, "expanded_url", nothing); default = "")
+                uw = safe_str(flat_getv(u, "unwound_url", nothing); default = "")
+                !isempty(url) && push!(urls, url)
+                !isempty(ex) && push!(expanded_urls, ex)
+                !isempty(uw) && push!(unwound_urls, uw)
+            end
+        end
+    end
+
+    context_domain_names = String[]
+    context_entity_names = String[]
+    if context_annotations !== nothing
+        for ca in context_annotations
+            domain = flat_getv(ca, "domain", nothing)
+            entity = flat_getv(ca, "entity", nothing)
+            dnm = domain === nothing ? "" : safe_str(flat_getv(domain, "name", nothing); default = "")
+            enm = entity === nothing ? "" : safe_str(flat_getv(entity, "name", nothing); default = "")
+            !isempty(dnm) && push!(context_domain_names, dnm)
+            !isempty(enm) && push!(context_entity_names, enm)
+        end
+    end
+
+    media_keys = String[]
+    media_types = String[]
+    media_urls = String[]
+    media_preview_image_urls = String[]
+    media_widths = String[]
+    media_heights = String[]
+    media_duration_ms = String[]
+    media_view_counts = String[]
+    media_objs = Any[]
+    keys = attachments === nothing ? nothing : flat_getv(attachments, "media_keys", nothing)
+    if keys !== nothing
+        for k in keys
+            mk = safe_str(k; default = "")
+            isempty(mk) && continue
+            push!(media_keys, mk)
+            m = get(media, mk, nothing)
+            m === nothing && continue
+            push!(media_objs, m)
+            typ = safe_str(flat_getv(m, "type", nothing); default = "")
+            url = safe_str(flat_getv(m, "url", nothing); default = "")
+            preview = safe_str(flat_getv(m, "preview_image_url", nothing); default = "")
+            width = safe_str(flat_getv(m, "width", nothing); default = "")
+            height = safe_str(flat_getv(m, "height", nothing); default = "")
+            duration = safe_str(flat_getv(m, "duration_ms", nothing); default = "")
+            mpm = flat_getv(m, "public_metrics", nothing)
+            views = mpm === nothing ? "" : safe_str(flat_getv(mpm, "view_count", nothing); default = "")
+            !isempty(typ) && push!(media_types, typ)
+            !isempty(url) && push!(media_urls, url)
+            !isempty(preview) && push!(media_preview_image_urls, preview)
+            !isempty(width) && push!(media_widths, width)
+            !isempty(height) && push!(media_heights, height)
+            !isempty(duration) && push!(media_duration_ms, duration)
+            !isempty(views) && push!(media_view_counts, views)
+        end
+    end
+
+    geo = flat_getv(tdata, "geo", nothing)
+    place_id = geo === nothing ? "" : safe_str(flat_getv(geo, "place_id", nothing); default = "")
+    place = isempty(place_id) ? nothing : get(places, place_id, nothing)
+
+    author = isempty(author_id) ? nothing : get(users, author_id, nothing)
+    author_pm = author === nothing ? nothing : flat_getv(author, "public_metrics", nothing)
+
+    edit_history = flat_getv(tdata, "edit_history_tweet_ids", nothing)
+
     return (
-        id = safe_str(_json_get(tw, "id", nothing); default = ""),
-        created_at = safe_str(_json_get(tw, "created_at", nothing); default = ""),
-        author_id = safe_str(_json_get(tw, "author_id", nothing); default = ""),
-        lang = safe_str(_json_get(tw, "lang", nothing); default = ""),
-        possibly_sensitive = safe_bool(_json_get(tw, "possibly_sensitive", nothing)),
-        like_count = pm === nothing ? missing : safe_int(_json_get(pm, "like_count", nothing)),
-        retweet_count = pm === nothing ? missing :
-                        safe_int(_json_get(pm, "retweet_count", nothing)),
-        reply_count = pm === nothing ? missing : safe_int(_json_get(pm, "reply_count", nothing)),
-        quote_count = pm === nothing ? missing : safe_int(_json_get(pm, "quote_count", nothing)),
-        bookmark_count = pm === nothing ? missing :
-                         safe_int(_json_get(pm, "bookmark_count", nothing)),
-        impression_count = pm === nothing ? missing :
-                           safe_int(_json_get(pm, "impression_count", nothing)),
-        text = safe_str(_json_get(tw, "text", nothing); default = ""),
+        tweet_id = flat_maybe_str(tweet_id),
+        created_at = flat_maybe_str(created_at),
+        author_id = flat_maybe_str(author_id),
+        author_username = author === nothing ? missing :
+                          flat_maybe_str(flat_getv(author, "username", nothing)),
+        author_name = author === nothing ? missing :
+                      flat_maybe_str(flat_getv(author, "name", nothing)),
+        lang = flat_maybe_str(lang),
+        text = flat_maybe_str(text),
+        possibly_sensitive = safe_bool(flat_getv(tdata, "possibly_sensitive", nothing)),
+        reply_settings = flat_maybe_str(reply_settings),
+        source = flat_maybe_str(source),
+        conversation_id = flat_maybe_str(conversation_id),
+        in_reply_to_user_id = flat_maybe_str(in_reply_to_user_id),
+        is_retweet = is_retweet,
+        is_quote = is_quote,
+        is_reply = is_reply,
+        referenced_tweet_types = flat_join_str(ref_types, sep),
+        referenced_tweet_ids = flat_join_str(ref_ids, sep),
+        original_tweet_id = flat_maybe_str(original_tweet_id),
+        original_author_id = original === nothing ? missing :
+                             flat_maybe_str(flat_getv(original, "author_id", nothing)),
+        original_created_at = original === nothing ? missing :
+                              flat_maybe_str(flat_getv(original, "created_at", nothing)),
+        original_lang = original === nothing ? missing :
+                        flat_maybe_str(flat_getv(original, "lang", nothing)),
+        original_text = original === nothing ? missing :
+                        flat_maybe_str(flat_getv(original, "text", nothing)),
+        retweet_count = _metric(pm, "retweet_count"),
+        reply_count = _metric(pm, "reply_count"),
+        like_count = _metric(pm, "like_count"),
+        quote_count = _metric(pm, "quote_count"),
+        bookmark_count = _metric(pm, "bookmark_count"),
+        impression_count = _metric(pm, "impression_count"),
+        original_retweet_count = _metric(original_pm, "retweet_count"),
+        original_reply_count = _metric(original_pm, "reply_count"),
+        original_like_count = _metric(original_pm, "like_count"),
+        original_quote_count = _metric(original_pm, "quote_count"),
+        original_bookmark_count = _metric(original_pm, "bookmark_count"),
+        original_impression_count = _metric(original_pm, "impression_count"),
+        mention_usernames = flat_join_str(mention_usernames, sep),
+        mention_ids = flat_join_str(mention_ids, sep),
+        mention_names = flat_join_str(mention_names, sep),
+        hashtags = flat_join_str(hashtags, sep),
+        urls = flat_join_str(urls, sep),
+        expanded_urls = flat_join_str(expanded_urls, sep),
+        unwound_urls = flat_join_str(unwound_urls, sep),
+        context_domain_names = flat_join_str(context_domain_names, sep),
+        context_entity_names = flat_join_str(context_entity_names, sep),
+        media_keys = flat_join_str(media_keys, sep),
+        media_types = flat_join_str(media_types, sep),
+        media_urls = flat_join_str(media_urls, sep),
+        media_preview_image_urls = flat_join_str(media_preview_image_urls, sep),
+        media_widths = flat_join_str(media_widths, sep),
+        media_heights = flat_join_str(media_heights, sep),
+        media_duration_ms = flat_join_str(media_duration_ms, sep),
+        media_view_counts = flat_join_str(media_view_counts, sep),
+        place_id = flat_maybe_str(place_id),
+        place_full_name = place === nothing ? missing :
+                          flat_maybe_str(flat_getv(place, "full_name", nothing)),
+        place_country_code = place === nothing ? missing :
+                             flat_maybe_str(flat_getv(place, "country_code", nothing)),
+        author_created_at = author === nothing ? missing :
+                            flat_maybe_str(flat_getv(author, "created_at", nothing)),
+        author_location = author === nothing ? missing :
+                          flat_maybe_str(flat_getv(author, "location", nothing)),
+        author_verified = author === nothing ? missing :
+                          safe_bool(flat_getv(author, "verified", nothing)),
+        author_protected = author === nothing ? missing :
+                           safe_bool(flat_getv(author, "protected", nothing)),
+        author_followers_count = _metric(author_pm, "followers_count"),
+        author_following_count = _metric(author_pm, "following_count"),
+        author_tweet_count = _metric(author_pm, "tweet_count"),
+        author_listed_count = _metric(author_pm, "listed_count"),
+        author_like_count = _metric(author_pm, "like_count"),
+        author_media_count = _metric(author_pm, "media_count"),
+        edit_history_tweet_ids =
+            edit_history === nothing ? missing :
+            flat_join_str([safe_str(x; default = "") for x in edit_history], sep),
+        is_edit_eligible = edit_controls === nothing ? missing :
+                           safe_bool(flat_getv(edit_controls, "is_edit_eligible", nothing)),
+        editable_until = edit_controls === nothing ? missing :
+                         flat_maybe_str(flat_getv(edit_controls, "editable_until", nothing)),
+        edits_remaining = edit_controls === nothing ? missing :
+                          safe_int(flat_getv(edit_controls, "edits_remaining", nothing)),
+        entities_json = flat_json_str(ents),
+        context_annotations_json = flat_json_str(context_annotations),
+        referenced_tweets_json = flat_json_str(rts),
+        attachments_json = flat_json_str(attachments),
+        public_metrics_json = flat_json_str(pm),
+        original_public_metrics_json = flat_json_str(original_pm),
+        author_user_json = flat_json_str(author),
+        media_json = isempty(media_objs) ? missing : flat_json_str(media_objs),
+        place_json = flat_json_str(place),
     )
 end
 
@@ -2795,11 +3180,6 @@ function _is_active_partial_jsonl_error(
     return _looks_like_json_unexpected_eof(e)
 end
 
-function write_csv_batch!(cfg::SearchConfig, batch::Vector{TweetRow})
-    isempty(batch) && return
-    CSV.write(out_csv(cfg), batch; append = isfile(out_csv(cfg)))
-end
-
 # ★ 追加: Arrow append の “stream format only” を安全復旧
 function _arrow_append_safe!(path::String, batch)
     try
@@ -2824,27 +3204,13 @@ function _arrow_append_safe!(path::String, batch)
     end
 end
 
-function write_arrow_batch!(cfg::SearchConfig, batch::Vector{TweetRow})
-    isempty(batch) && return
-    apath = out_arrow(cfg)
-
-    if cfg.arrow_append
-        if !isfile(apath)
-            # append 前提なので stream 形式で作る
-            Arrow.write(apath, batch; file = false)
-        else
-            _arrow_append_safe!(apath, batch)
-        end
-    else
-        rm(apath; force = true)
-        Arrow.write(apath, batch)  # file 形式
-    end
-end
-
-function _convert_outputs_from_jsonl_paths(
+function _convert_flat_outputs_from_jsonl_paths(
     cfg::SearchConfig,
     jsonl_paths::Vector{String},
     state_path::AbstractString;
+    csv_path::AbstractString,
+    arrow_path::AbstractString,
+    sep::AbstractString = ";",
     active_path::Union{Nothing,String} = nothing,
 )
     validate!(cfg)
@@ -2858,11 +3224,11 @@ function _convert_outputs_from_jsonl_paths(
     offset = cfg.convert_incremental ? st.converted_jsonl_offset : 0
 
     if offset > 0
-        if cfg.emit_csv && !isfile(out_csv(cfg))
+        if cfg.emit_csv && !isfile(csv_path)
             @warn "CSV missing while incremental offset>0; resetting offset to 0"
             offset = 0
         end
-        if cfg.emit_arrow && !isfile(out_arrow(cfg))
+        if cfg.emit_arrow && !isfile(arrow_path)
             @warn "Arrow missing while incremental offset>0; resetting offset to 0"
             offset = 0
         end
@@ -2876,15 +3242,111 @@ function _convert_outputs_from_jsonl_paths(
     end
 
     if offset == 0
-        cfg.emit_csv && isfile(out_csv(cfg)) && rm(out_csv(cfg); force = true)
-        cfg.emit_arrow && isfile(out_arrow(cfg)) && rm(out_arrow(cfg); force = true)
+        cfg.emit_csv && isfile(csv_path) && rm(csv_path; force = true)
+        cfg.emit_arrow && isfile(arrow_path) && rm(arrow_path; force = true)
     end
 
     batch = TweetRow[]
     sizehint!(batch, cfg.convert_batch_size)
-
     new_offset = offset
     last_good_offset = offset
+    wrote_arrow = false
+
+    pending_tweets = Vector{Any}()
+    users_cache = Dict{String,Any}()
+    media_cache = Dict{String,Any}()
+    places_cache = Dict{String,Any}()
+    included_tweets_cache = Dict{String,Any}()
+
+    # page マーカーが無い古いJSONL用の安全弁
+    MAX_PENDING_WITHOUT_PAGE = 50_000
+
+    function write_arrow_flat_batch!()
+        if !wrote_arrow
+            if cfg.arrow_append && isfile(arrow_path)
+                _arrow_append_safe!(String(arrow_path), batch)
+            else
+                !cfg.arrow_append && isfile(arrow_path) && rm(arrow_path; force = true)
+                Arrow.write(arrow_path, batch; file = false)
+            end
+        else
+            _arrow_append_safe!(String(arrow_path), batch)
+        end
+        wrote_arrow = true
+    end
+
+    function write_nonempty_batch!()
+        isempty(batch) && return
+        cfg.emit_csv && CSV.write(csv_path, batch; append = isfile(csv_path))
+        cfg.emit_arrow && write_arrow_flat_batch!()
+        empty!(batch)
+    end
+
+    function write_batch_if_full!()
+        length(batch) < cfg.convert_batch_size && return
+        write_nonempty_batch!()
+    end
+
+    function flush_pending!()
+        isempty(pending_tweets) && return
+        for tdata in pending_tweets
+            push!(
+                batch,
+                tweet_to_row(
+                    tdata;
+                    sep = sep,
+                    users = users_cache,
+                    media = media_cache,
+                    places = places_cache,
+                    included_tweets = included_tweets_cache,
+                ),
+            )
+            write_batch_if_full!()
+        end
+        empty!(pending_tweets)
+        empty!(users_cache)
+        empty!(media_cache)
+        empty!(places_cache)
+        empty!(included_tweets_cache)
+    end
+
+    last_kind = :none
+
+    function handle_flat_record!(obj)
+        kind = safe_str(_json_get(obj, "kind", nothing); default = "")
+        if kind == "tweet"
+            if length(pending_tweets) >= MAX_PENDING_WITHOUT_PAGE
+                flush_pending!()
+            end
+            if last_kind in (:include, :page) && !isempty(pending_tweets)
+                flush_pending!()
+            end
+            data = _json_get(obj, "data", nothing)
+            data === nothing || push!(pending_tweets, data)
+            last_kind = :tweet
+        elseif startswith(kind, "include:")
+            suf = replace(kind, "include:" => "")
+            d = _json_get(obj, "data", nothing)
+            if suf == "users"
+                uid = safe_str(flat_getv(d, "id", nothing); default = "")
+                !isempty(uid) && (users_cache[uid] = d)
+            elseif suf == "media"
+                mk = safe_str(flat_getv(d, "media_key", nothing); default = "")
+                !isempty(mk) && (media_cache[mk] = d)
+            elseif suf == "places"
+                pid = safe_str(flat_getv(d, "id", nothing); default = "")
+                !isempty(pid) && (places_cache[pid] = d)
+            elseif suf == "tweets"
+                tid = safe_str(flat_getv(d, "id", nothing); default = "")
+                !isempty(tid) && (included_tweets_cache[tid] = d)
+            end
+            last_kind = :include
+        elseif kind == "page"
+            flush_pending!()
+            last_kind = :page
+        end
+    end
+
     file_base_offset = 0
     stop_at_partial = false
 
@@ -2912,21 +3374,8 @@ function _convert_outputs_from_jsonl_paths(
                     continue
                 end
 
-                try
-                    obj = JSON3.read(s)
-                    kind = safe_str(_json_get(obj, "kind", nothing); default = "")
-                    if kind == "tweet"
-                        data = _json_get(obj, "data", nothing)
-                        data === nothing || push!(batch, tweet_to_row(data))
-
-                        if length(batch) >= cfg.convert_batch_size
-                            cfg.emit_csv && write_csv_batch!(cfg, batch)
-                            cfg.emit_arrow && write_arrow_batch!(cfg, batch)
-                            empty!(batch)
-                        end
-                    end
-                    last_good_offset = line_end_offset
-                    new_offset = last_good_offset
+                obj = try
+                    JSON3.read(s)
                 catch e
                     if _is_active_partial_jsonl_error(
                         e,
@@ -2944,26 +3393,50 @@ function _convert_outputs_from_jsonl_paths(
                     @warn "JSONL parse error (skip)" exception = e path = jsonl
                     last_good_offset = line_end_offset
                     new_offset = last_good_offset
+                    continue
                 end
+
+                handle_flat_record!(obj)
+                last_good_offset = line_end_offset
+                new_offset = last_good_offset
             end
         end
         file_base_offset += file_size
         stop_at_partial && break
     end
 
-    if !isempty(batch)
-        cfg.emit_csv && write_csv_batch!(cfg, batch)
-        cfg.emit_arrow && write_arrow_batch!(cfg, batch)
-        empty!(batch)
-    end
+    flush_pending!()
+
+    write_nonempty_batch!()
 
     st.converted_jsonl_offset = new_offset
     st.converted_at = string(Dates.now(Dates.UTC))
     save_state(state_path, st)
 
     @info "Conversion done" csv = cfg.emit_csv arrow = cfg.emit_arrow new_offset =
-        new_offset
-    return (converted_offset = new_offset, converted_at = st.converted_at)
+        new_offset csv_path = csv_path arrow_path = arrow_path
+    return (
+        converted_offset = new_offset,
+        converted_at = st.converted_at,
+        csv_path = csv_path,
+        arrow_path = arrow_path,
+    )
+end
+
+function _convert_outputs_from_jsonl_paths(
+    cfg::SearchConfig,
+    jsonl_paths::Vector{String},
+    state_path::AbstractString;
+    active_path::Union{Nothing,String} = nothing,
+)
+    return _convert_flat_outputs_from_jsonl_paths(
+        cfg,
+        jsonl_paths,
+        state_path;
+        csv_path = out_csv(cfg),
+        arrow_path = out_arrow(cfg),
+        active_path = active_path,
+    )
 end
 
 function convert_outputs(cfg::SearchConfig)
@@ -2999,348 +3472,6 @@ out_state_wide(cfg::StreamConfig) =
 out_csv_wide(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).wide.csv")
 out_arrow_wide(cfg::StreamConfig) = joinpath(cfg.out_dir, "$(cfg.task_name).wide.arrow")
 
-wide_maybe_str(x) = begin
-    s = safe_str(x; default = "")
-    isempty(s) ? missing : s
-end
-wide_join_str(xs::Vector{String}, sep::AbstractString) =
-    isempty(xs) ? missing : join(xs, sep)
-wide_json_str(x) = begin
-    isnull(x) && return missing
-    try
-        String(JSON3.write(x))
-    catch
-        missing
-    end
-end
-wide_getv(obj, key, default = nothing) = _json_get(obj, String(key), default)
-
-function wide_author_cols(author_id::AbstractString, users::Dict{String,Any})
-    u = get(users, author_id, nothing)
-    if u === nothing
-        return (
-            author_username = missing,
-            author_name = missing,
-            author_created_at = missing,
-            author_location = missing,
-            author_verified = missing,
-            author_protected = missing,
-            author_description = missing,
-            author_profile_image_url = missing,
-            author_followers_count = missing,
-            author_following_count = missing,
-            author_tweet_count = missing,
-            author_listed_count = missing,
-            author_like_count = missing,
-            author_media_count = missing,
-            author_user_json = missing,
-        )
-    end
-    pm = wide_getv(u, "public_metrics", nothing)
-    return (
-        author_username = wide_maybe_str(wide_getv(u, "username", nothing)),
-        author_name = wide_maybe_str(wide_getv(u, "name", nothing)),
-        author_created_at = wide_maybe_str(wide_getv(u, "created_at", nothing)),
-        author_location = wide_maybe_str(wide_getv(u, "location", nothing)),
-        author_verified = safe_bool(wide_getv(u, "verified", nothing)),
-        author_protected = safe_bool(wide_getv(u, "protected", nothing)),
-        author_description = wide_maybe_str(wide_getv(u, "description", nothing)),
-        author_profile_image_url = wide_maybe_str(
-            wide_getv(u, "profile_image_url", nothing),
-        ),
-        author_followers_count = pm === nothing ? missing :
-                                 safe_int(wide_getv(pm, "followers_count", nothing)),
-        author_following_count = pm === nothing ? missing :
-                                 safe_int(wide_getv(pm, "following_count", nothing)),
-        author_tweet_count = pm === nothing ? missing :
-                             safe_int(wide_getv(pm, "tweet_count", nothing)),
-        author_listed_count = pm === nothing ? missing :
-                              safe_int(wide_getv(pm, "listed_count", nothing)),
-        author_like_count = pm === nothing ? missing :
-                            safe_int(wide_getv(pm, "like_count", nothing)),
-        author_media_count = pm === nothing ? missing :
-                             safe_int(wide_getv(pm, "media_count", nothing)),
-        author_user_json = wide_json_str(u),
-    )
-end
-
-function wide_mention_cols(tdata, users::Dict{String,Any}; sep::AbstractString = ";")
-    ents = wide_getv(tdata, "entities", nothing)
-    mentions = ents === nothing ? nothing : wide_getv(ents, "mentions", nothing)
-    mentions === nothing && return (
-        mention_usernames = missing,
-        mention_ids = missing,
-        mention_names = missing,
-        mentioned_users_json = missing,
-    )
-
-    ids = String[]
-    usernames = String[]
-    names = String[]
-    mentioned_objs = Any[]
-    for m in mentions
-        push!(mentioned_objs, m)
-        mid = safe_str(wide_getv(m, "id", nothing); default = "")
-        muser = safe_str(wide_getv(m, "username", nothing); default = "")
-        !isempty(mid) && push!(ids, mid)
-        !isempty(muser) && push!(usernames, muser)
-        u = (!isempty(mid) ? get(users, mid, nothing) : nothing)
-        nm = u === nothing ? "" : safe_str(wide_getv(u, "name", nothing); default = "")
-        !isempty(nm) && push!(names, nm)
-    end
-
-    return (
-        mention_usernames = wide_join_str(usernames, sep),
-        mention_ids = wide_join_str(ids, sep),
-        mention_names = wide_join_str(names, sep),
-        mentioned_users_json = isempty(mentioned_objs) ? missing :
-                               wide_json_str(mentioned_objs),
-    )
-end
-
-function wide_media_cols(tdata, media::Dict{String,Any}; sep::AbstractString = ";")
-    at = wide_getv(tdata, "attachments", nothing)
-    keys = at === nothing ? nothing : wide_getv(at, "media_keys", nothing)
-    keys === nothing && return (
-        media_keys = missing,
-        media_urls = missing,
-        media_types = missing,
-        media_widths = missing,
-        media_heights = missing,
-        media_json = missing,
-    )
-
-    mkeys = String[]
-    urls = String[]
-    types = String[]
-    widths = String[]
-    heights = String[]
-    mfull = Any[]
-    for k in keys
-        mk = safe_str(k; default = "")
-        isempty(mk) && continue
-        push!(mkeys, mk)
-        m = get(media, mk, nothing)
-        if m !== nothing
-            push!(mfull, m)
-            url = safe_str(wide_getv(m, "url", nothing); default = "")
-            isempty(url) &&
-                (url = safe_str(wide_getv(m, "preview_image_url", nothing); default = ""))
-            typ = safe_str(wide_getv(m, "type", nothing); default = "")
-            w = safe_str(wide_getv(m, "width", nothing); default = "")
-            h = safe_str(wide_getv(m, "height", nothing); default = "")
-            !isempty(url) && push!(urls, url)
-            !isempty(typ) && push!(types, typ)
-            !isempty(w) && push!(widths, w)
-            !isempty(h) && push!(heights, h)
-        end
-    end
-
-    return (
-        media_keys = wide_join_str(mkeys, sep),
-        media_urls = isempty(urls) ? missing : join(urls, sep),
-        media_types = isempty(types) ? missing : join(types, sep),
-        media_widths = isempty(widths) ? missing : join(widths, sep),
-        media_heights = isempty(heights) ? missing : join(heights, sep),
-        media_json = isempty(mfull) ? missing : wide_json_str(mfull),
-    )
-end
-
-function wide_place_cols(place_id::AbstractString, places::Dict{String,Any})
-    p = get(places, place_id, nothing)
-    if p === nothing
-        return (
-            place_id = isempty(place_id) ? missing : place_id,
-            place_full_name = missing,
-            place_name = missing,
-            place_country = missing,
-            place_country_code = missing,
-            place_type = missing,
-            place_geo_json = missing,
-            place_json = missing,
-        )
-    end
-    geo = wide_getv(p, "geo", nothing)
-    return (
-        place_id = isempty(place_id) ? missing : place_id,
-        place_full_name = wide_maybe_str(wide_getv(p, "full_name", nothing)),
-        place_name = wide_maybe_str(wide_getv(p, "name", nothing)),
-        place_country = wide_maybe_str(wide_getv(p, "country", nothing)),
-        place_country_code = wide_maybe_str(wide_getv(p, "country_code", nothing)),
-        place_type = wide_maybe_str(wide_getv(p, "place_type", nothing)),
-        place_geo_json = geo === nothing ? missing : wide_json_str(geo),
-        place_json = wide_json_str(p),
-    )
-end
-
-function wide_referenced_tweets_cols(
-    rts,
-    tweets::Dict{String,Any};
-    sep::AbstractString = ";",
-)
-    rts === nothing && return (
-        referenced_included_texts = missing,
-        referenced_included_author_ids = missing,
-        referenced_included_created_ats = missing,
-        referenced_included_langs = missing,
-        referenced_included_json = missing,
-    )
-
-    texts = String[]
-    author_ids = String[]
-    created_ats = String[]
-    langs = String[]
-    hit_objs = Any[]
-    for r in rts
-        rid = safe_str(wide_getv(r, "id", nothing); default = "")
-        isempty(rid) && continue
-        t = get(tweets, rid, nothing)
-        t === nothing && continue
-        push!(hit_objs, t)
-        txt = safe_str(wide_getv(t, "text", nothing); default = "")
-        aid = safe_str(wide_getv(t, "author_id", nothing); default = "")
-        cat = safe_str(wide_getv(t, "created_at", nothing); default = "")
-        lg = safe_str(wide_getv(t, "lang", nothing); default = "")
-        !isempty(txt) && push!(texts, txt)
-        !isempty(aid) && push!(author_ids, aid)
-        !isempty(cat) && push!(created_ats, cat)
-        !isempty(lg) && push!(langs, lg)
-    end
-
-    return (
-        referenced_included_texts = isempty(texts) ? missing : join(texts, sep),
-        referenced_included_author_ids = isempty(author_ids) ? missing :
-                                         join(author_ids, sep),
-        referenced_included_created_ats = isempty(created_ats) ? missing :
-                                          join(created_ats, sep),
-        referenced_included_langs = isempty(langs) ? missing : join(langs, sep),
-        referenced_included_json = isempty(hit_objs) ? missing : wide_json_str(hit_objs),
-    )
-end
-
-function tweet_to_row_wide(
-    tdata;
-    sep::AbstractString = ";",
-    users::Dict{String,Any} = Dict{String,Any}(),
-    media::Dict{String,Any} = Dict{String,Any}(),
-    places::Dict{String,Any} = Dict{String,Any}(),
-    included_tweets::Dict{String,Any} = Dict{String,Any}(),
-)
-    id = safe_str(wide_getv(tdata, "id", nothing); default = "")
-    author_id = safe_str(wide_getv(tdata, "author_id", nothing); default = "")
-    created_at = safe_str(wide_getv(tdata, "created_at", nothing); default = "")
-    lang = safe_str(wide_getv(tdata, "lang", nothing); default = "")
-    text = safe_str(wide_getv(tdata, "text", nothing); default = "")
-    conversation_id = safe_str(wide_getv(tdata, "conversation_id", nothing); default = "")
-    in_reply_to_user_id =
-        safe_str(wide_getv(tdata, "in_reply_to_user_id", nothing); default = "")
-    source = safe_str(wide_getv(tdata, "source", nothing); default = "")
-    reply_settings = safe_str(wide_getv(tdata, "reply_settings", nothing); default = "")
-    possibly_sensitive = safe_bool(wide_getv(tdata, "possibly_sensitive", nothing))
-
-    pm = wide_getv(tdata, "public_metrics", nothing)
-    retweet_count =
-        pm === nothing ? missing : safe_int(wide_getv(pm, "retweet_count", nothing))
-    reply_count = pm === nothing ? missing : safe_int(wide_getv(pm, "reply_count", nothing))
-    like_count = pm === nothing ? missing : safe_int(wide_getv(pm, "like_count", nothing))
-    quote_count = pm === nothing ? missing : safe_int(wide_getv(pm, "quote_count", nothing))
-    bookmark_count =
-        pm === nothing ? missing : safe_int(wide_getv(pm, "bookmark_count", nothing))
-    impression_count =
-        pm === nothing ? missing : safe_int(wide_getv(pm, "impression_count", nothing))
-
-    geo = wide_getv(tdata, "geo", nothing)
-    place_id =
-        geo === nothing ? "" : safe_str(wide_getv(geo, "place_id", nothing); default = "")
-
-    ents = wide_getv(tdata, "entities", nothing)
-    hashtags = String[]
-    urls_expanded = String[]
-    urls_unwound = String[]
-    annotations_text = String[]
-
-    if ents !== nothing
-        hs = wide_getv(ents, "hashtags", nothing)
-        if hs !== nothing
-            for h in hs
-                tag = safe_str(wide_getv(h, "tag", nothing); default = "")
-                !isempty(tag) && push!(hashtags, tag)
-            end
-        end
-        us = wide_getv(ents, "urls", nothing)
-        if us !== nothing
-            for u in us
-                ex = safe_str(wide_getv(u, "expanded_url", nothing); default = "")
-                uw = safe_str(wide_getv(u, "unwound_url", nothing); default = "")
-                !isempty(ex) && push!(urls_expanded, ex)
-                !isempty(uw) && push!(urls_unwound, uw)
-            end
-        end
-        ann = wide_getv(ents, "annotations", nothing)
-        if ann !== nothing
-            for a in ann
-                nt = safe_str(wide_getv(a, "normalized_text", nothing); default = "")
-                ty = safe_str(wide_getv(a, "type", nothing); default = "")
-                if !isempty(nt)
-                    isempty(ty) ? push!(annotations_text, nt) :
-                    push!(annotations_text, string(ty, ":", nt))
-                end
-            end
-        end
-    end
-
-    rts = wide_getv(tdata, "referenced_tweets", nothing)
-    ref_types = String[]
-    ref_ids = String[]
-    if rts !== nothing
-        for r in rts
-            ty = safe_str(wide_getv(r, "type", nothing); default = "")
-            rid = safe_str(wide_getv(r, "id", nothing); default = "")
-            !isempty(ty) && push!(ref_types, ty)
-            !isempty(rid) && push!(ref_ids, rid)
-        end
-    end
-
-    base = (
-        id = isempty(id) ? missing : id,
-        author_id = isempty(author_id) ? missing : author_id,
-        created_at = isempty(created_at) ? missing : created_at,
-        lang = isempty(lang) ? missing : lang,
-        text = isempty(text) ? missing : text,
-        conversation_id = isempty(conversation_id) ? missing : conversation_id,
-        in_reply_to_user_id = isempty(in_reply_to_user_id) ? missing : in_reply_to_user_id,
-        source = isempty(source) ? missing : source,
-        reply_settings = isempty(reply_settings) ? missing : reply_settings,
-        possibly_sensitive = possibly_sensitive,
-        retweet_count = retweet_count,
-        reply_count = reply_count,
-        like_count = like_count,
-        quote_count = quote_count,
-        bookmark_count = bookmark_count,
-        impression_count = impression_count,
-        hashtags = wide_join_str(hashtags, sep),
-        urls_expanded = wide_join_str(urls_expanded, sep),
-        urls_unwound = wide_join_str(urls_unwound, sep),
-        annotations = wide_join_str(annotations_text, sep),
-        referenced_tweet_types = wide_join_str(ref_types, sep),
-        referenced_tweet_ids = wide_join_str(ref_ids, sep),
-        entities_json = ents === nothing ? missing : wide_json_str(ents),
-        public_metrics_json = pm === nothing ? missing : wide_json_str(pm),
-        referenced_tweets_json = rts === nothing ? missing : wide_json_str(rts),
-        geo_json = geo === nothing ? missing : wide_json_str(geo),
-    )
-
-    aid = isempty(author_id) ? "" : author_id
-    return merge(
-        base,
-        wide_author_cols(aid, users),
-        wide_mention_cols(tdata, users; sep = sep),
-        wide_media_cols(tdata, media; sep = sep),
-        wide_place_cols(place_id, places),
-        wide_referenced_tweets_cols(rts, included_tweets; sep = sep),
-    )
-end
-
 function _convert_outputs_wide_from_jsonl_paths(
     cfg::SearchConfig,
     jsonl_paths::Vector{String},
@@ -3348,206 +3479,15 @@ function _convert_outputs_wide_from_jsonl_paths(
     sep::AbstractString = ";",
     active_path::Union{Nothing,String} = nothing,
 )
-    validate!(cfg)
-    mkpath(cfg.out_dir)
-
-    isempty(jsonl_paths) && error("JSONL not found")
-
-    csv_path = out_csv_wide(cfg)
-    arrow_path = out_arrow_wide(cfg)
-
-    st = load_state(state_path)
-    st === nothing && (st = CollectorState())
-
-    offset = cfg.convert_incremental ? st.converted_jsonl_offset : 0
-
-    if offset > 0
-        cfg.emit_csv && !isfile(csv_path) && (offset = 0)
-        cfg.emit_arrow && !isfile(arrow_path) && (offset = 0)
-    end
-
-    fsz = sum(stat(p).size for p in jsonl_paths)
-    offset > fsz && (offset = 0)
-
-    if offset == 0
-        cfg.emit_csv && isfile(csv_path) && rm(csv_path; force = true)
-        cfg.emit_arrow && isfile(arrow_path) && rm(arrow_path; force = true)
-    end
-
-    batch = Vector{NamedTuple}()
-    sizehint!(batch, cfg.convert_batch_size)
-    new_offset = offset
-    last_good_offset = offset
-    wrote_arrow = false
-
-    pending_tweets = Vector{Any}()
-    users_cache = Dict{String,Any}()
-    media_cache = Dict{String,Any}()
-    places_cache = Dict{String,Any}()
-    included_tweets_cache = Dict{String,Any}()
-
-    # page マーカーが無い古いJSONL用の安全弁
-    MAX_PENDING_WITHOUT_PAGE = 50_000
-
-    function write_batch_if_full!()
-        if length(batch) < cfg.convert_batch_size
-            return
-        end
-        cfg.emit_csv && CSV.write(csv_path, batch; append = isfile(csv_path))
-        if cfg.emit_arrow
-            if !wrote_arrow || !cfg.arrow_append || !isfile(arrow_path)
-                Arrow.write(arrow_path, batch; file = !cfg.arrow_append)
-                wrote_arrow = true
-            else
-                _arrow_append_safe!(arrow_path, batch)
-            end
-        end
-        empty!(batch)
-    end
-
-    function flush_pending!()
-        isempty(pending_tweets) && return
-        for tdata in pending_tweets
-            push!(
-                batch,
-                tweet_to_row_wide(
-                    tdata;
-                    sep = sep,
-                    users = users_cache,
-                    media = media_cache,
-                    places = places_cache,
-                    included_tweets = included_tweets_cache,
-                ),
-            )
-            write_batch_if_full!()
-        end
-        empty!(pending_tweets)
-        empty!(users_cache)
-        empty!(media_cache)
-        empty!(places_cache)
-        empty!(included_tweets_cache)
-    end
-
-    last_kind = :none
-
-    file_base_offset = 0
-    stop_at_partial = false
-    for jsonl in jsonl_paths
-        file_size = stat(jsonl).size
-        if offset >= file_base_offset + file_size
-            file_base_offset += file_size
-            continue
-        end
-        file_offset = max(offset - file_base_offset, 0)
-        open(jsonl, "r") do io
-            ensure_offset_boundary!(io, file_offset)
-            last_good_offset = max(last_good_offset, file_base_offset + position(io))
-            new_offset = last_good_offset
-
-            while !eof(io)
-                line_start_offset = file_base_offset + position(io)
-                line = readline(io)
-                line_end_offset = file_base_offset + position(io)
-
-                s = strip(line)
-                if isempty(s)
-                    last_good_offset = line_end_offset
-                    new_offset = last_good_offset
-                    continue
-                end
-
-                try
-                    obj = JSON3.read(s)
-                    kind = safe_str(_json_get(obj, "kind", nothing); default = "")
-
-                    if kind == "tweet"
-                        # page 無しで tweet が延々続く場合のOOM回避
-                        if length(pending_tweets) >= MAX_PENDING_WITHOUT_PAGE
-                            flush_pending!()
-                        end
-                        # includes の後に次の tweet が来たら、前ページ分は確定している可能性が高い
-                        if last_kind in (:include, :page) && !isempty(pending_tweets)
-                            flush_pending!()
-                        end
-                        data = _json_get(obj, "data", nothing)
-                        data === nothing || push!(pending_tweets, data)
-                        last_kind = :tweet
-
-                    elseif startswith(kind, "include:")
-                        suf = replace(kind, "include:" => "")
-                        d = _json_get(obj, "data", nothing)
-                        if suf == "users"
-                            uid = safe_str(wide_getv(d, "id", nothing); default = "")
-                            !isempty(uid) && (users_cache[uid] = d)
-                        elseif suf == "media"
-                            mk = safe_str(wide_getv(d, "media_key", nothing); default = "")
-                            !isempty(mk) && (media_cache[mk] = d)
-                        elseif suf == "places"
-                            pid = safe_str(wide_getv(d, "id", nothing); default = "")
-                            !isempty(pid) && (places_cache[pid] = d)
-                        elseif suf == "tweets"
-                            tid = safe_str(wide_getv(d, "id", nothing); default = "")
-                            !isempty(tid) && (included_tweets_cache[tid] = d)
-                        end
-                        last_kind = :include
-
-                    elseif kind == "page"
-                        # ページ境界で flush
-                        flush_pending!()
-                        last_kind = :page
-
-                    else
-                        # その他kindは無視
-                    end
-                    last_good_offset = line_end_offset
-                    new_offset = last_good_offset
-
-                catch e
-                    if _is_active_partial_jsonl_error(
-                        e,
-                        jsonl,
-                        active_path,
-                        line_end_offset,
-                        file_base_offset + file_size,
-                    )
-                        @warn "JSONL partial final line; will retry on next wide conversion" path =
-                            jsonl offset = line_start_offset
-                        new_offset = last_good_offset
-                        stop_at_partial = true
-                        break
-                    end
-                    @warn "JSONL parse error (skip)" exception = e offset = new_offset path =
-                        jsonl
-                    last_good_offset = line_end_offset
-                    new_offset = last_good_offset
-                end
-            end
-        end
-        file_base_offset += file_size
-        stop_at_partial && break
-    end
-
-    flush_pending!()
-
-    if !isempty(batch)
-        cfg.emit_csv && CSV.write(csv_path, batch; append = isfile(csv_path))
-        if cfg.emit_arrow
-            if !wrote_arrow || !cfg.arrow_append || !isfile(arrow_path)
-                Arrow.write(arrow_path, batch; file = !cfg.arrow_append)
-            else
-                _arrow_append_safe!(arrow_path, batch)
-            end
-        end
-        empty!(batch)
-    end
-
-    st.converted_jsonl_offset = new_offset
-    st.converted_at = string(Dates.now(Dates.UTC))
-    save_state(state_path, st)
-
-    @info "Wide conversion done" csv = cfg.emit_csv arrow = cfg.emit_arrow new_offset =
-        new_offset csv_path = csv_path arrow_path = arrow_path
-    return (converted_offset = new_offset, csv_path = csv_path, arrow_path = arrow_path)
+    return _convert_flat_outputs_from_jsonl_paths(
+        cfg,
+        jsonl_paths,
+        state_path;
+        csv_path = out_csv_wide(cfg),
+        arrow_path = out_arrow_wide(cfg),
+        sep = sep,
+        active_path = active_path,
+    )
 end
 
 function convert_outputs_wide(cfg::SearchConfig; sep::AbstractString = ";")
