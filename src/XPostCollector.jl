@@ -3275,13 +3275,16 @@ function _convert_flat_outputs_from_jsonl_paths(
         wrote_arrow = true
     end
 
-    function write_batch_if_full!()
-        if length(batch) < cfg.convert_batch_size
-            return
-        end
+    function write_nonempty_batch!()
+        isempty(batch) && return
         cfg.emit_csv && CSV.write(csv_path, batch; append = isfile(csv_path))
         cfg.emit_arrow && write_arrow_flat_batch!()
         empty!(batch)
+    end
+
+    function write_batch_if_full!()
+        length(batch) < cfg.convert_batch_size && return
+        write_nonempty_batch!()
     end
 
     function flush_pending!()
@@ -3308,6 +3311,42 @@ function _convert_flat_outputs_from_jsonl_paths(
     end
 
     last_kind = :none
+
+    function handle_flat_record!(obj)
+        kind = safe_str(_json_get(obj, "kind", nothing); default = "")
+        if kind == "tweet"
+            if length(pending_tweets) >= MAX_PENDING_WITHOUT_PAGE
+                flush_pending!()
+            end
+            if last_kind in (:include, :page) && !isempty(pending_tweets)
+                flush_pending!()
+            end
+            data = _json_get(obj, "data", nothing)
+            data === nothing || push!(pending_tweets, data)
+            last_kind = :tweet
+        elseif startswith(kind, "include:")
+            suf = replace(kind, "include:" => "")
+            d = _json_get(obj, "data", nothing)
+            if suf == "users"
+                uid = safe_str(flat_getv(d, "id", nothing); default = "")
+                !isempty(uid) && (users_cache[uid] = d)
+            elseif suf == "media"
+                mk = safe_str(flat_getv(d, "media_key", nothing); default = "")
+                !isempty(mk) && (media_cache[mk] = d)
+            elseif suf == "places"
+                pid = safe_str(flat_getv(d, "id", nothing); default = "")
+                !isempty(pid) && (places_cache[pid] = d)
+            elseif suf == "tweets"
+                tid = safe_str(flat_getv(d, "id", nothing); default = "")
+                !isempty(tid) && (included_tweets_cache[tid] = d)
+            end
+            last_kind = :include
+        elseif kind == "page"
+            flush_pending!()
+            last_kind = :page
+        end
+    end
+
     file_base_offset = 0
     stop_at_partial = false
 
@@ -3335,42 +3374,8 @@ function _convert_flat_outputs_from_jsonl_paths(
                     continue
                 end
 
-                try
-                    obj = JSON3.read(s)
-                    kind = safe_str(_json_get(obj, "kind", nothing); default = "")
-                    if kind == "tweet"
-                        if length(pending_tweets) >= MAX_PENDING_WITHOUT_PAGE
-                            flush_pending!()
-                        end
-                        if last_kind in (:include, :page) && !isempty(pending_tweets)
-                            flush_pending!()
-                        end
-                        data = _json_get(obj, "data", nothing)
-                        data === nothing || push!(pending_tweets, data)
-                        last_kind = :tweet
-                    elseif startswith(kind, "include:")
-                        suf = replace(kind, "include:" => "")
-                        d = _json_get(obj, "data", nothing)
-                        if suf == "users"
-                            uid = safe_str(flat_getv(d, "id", nothing); default = "")
-                            !isempty(uid) && (users_cache[uid] = d)
-                        elseif suf == "media"
-                            mk = safe_str(flat_getv(d, "media_key", nothing); default = "")
-                            !isempty(mk) && (media_cache[mk] = d)
-                        elseif suf == "places"
-                            pid = safe_str(flat_getv(d, "id", nothing); default = "")
-                            !isempty(pid) && (places_cache[pid] = d)
-                        elseif suf == "tweets"
-                            tid = safe_str(flat_getv(d, "id", nothing); default = "")
-                            !isempty(tid) && (included_tweets_cache[tid] = d)
-                        end
-                        last_kind = :include
-                    elseif kind == "page"
-                        flush_pending!()
-                        last_kind = :page
-                    end
-                    last_good_offset = line_end_offset
-                    new_offset = last_good_offset
+                obj = try
+                    JSON3.read(s)
                 catch e
                     if _is_active_partial_jsonl_error(
                         e,
@@ -3388,7 +3393,12 @@ function _convert_flat_outputs_from_jsonl_paths(
                     @warn "JSONL parse error (skip)" exception = e path = jsonl
                     last_good_offset = line_end_offset
                     new_offset = last_good_offset
+                    continue
                 end
+
+                handle_flat_record!(obj)
+                last_good_offset = line_end_offset
+                new_offset = last_good_offset
             end
         end
         file_base_offset += file_size
@@ -3397,11 +3407,7 @@ function _convert_flat_outputs_from_jsonl_paths(
 
     flush_pending!()
 
-    if !isempty(batch)
-        cfg.emit_csv && CSV.write(csv_path, batch; append = isfile(csv_path))
-        cfg.emit_arrow && write_arrow_flat_batch!()
-        empty!(batch)
-    end
+    write_nonempty_batch!()
 
     st.converted_jsonl_offset = new_offset
     st.converted_at = string(Dates.now(Dates.UTC))

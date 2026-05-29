@@ -61,6 +61,29 @@ using JET
 # ---------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------
+mutable struct CollectLogger <: AbstractLogger
+    messages::Vector{String}
+end
+
+Logging.min_enabled_level(::CollectLogger) = Logging.Debug
+Logging.shouldlog(::CollectLogger, level, _module, group, id) = true
+Logging.catch_exceptions(::CollectLogger) = false
+
+function Logging.handle_message(
+    logger::CollectLogger,
+    level,
+    message,
+    _module,
+    group,
+    id,
+    file,
+    line;
+    kwargs...,
+)
+    push!(logger.messages, string(message))
+    return nothing
+end
+
 function with_temp_cfg(f::Function; task = "ut_task")
     mktempdir() do dir
         cfg = SearchConfig(
@@ -516,6 +539,29 @@ end
             convert_outputs(cfg)
             @test count_csv_rows(csvp) == 2
         end
+    end
+end
+
+@testset "convert_outputs propagates writer failures without parse skip" begin
+    with_temp_cfg(task = "conv_writer_failure") do cfg, dir
+        jsonl = out_jsonl(cfg)
+        state = out_state(cfg)
+        arrp = out_arrow(cfg)
+        cfg.emit_csv = false
+        cfg.emit_arrow = true
+        cfg.convert_batch_size = 1
+
+        write_jsonl_lines(jsonl, [jsonl_tweet_line("1"), jsonl_page_line(1)])
+        mkpath(arrp)
+
+        logger = CollectLogger(String[])
+        with_logger(logger) do
+            @test_throws Exception convert_outputs(cfg)
+        end
+
+        st = load_state(state)
+        @test st === nothing || st.converted_jsonl_offset == 0
+        @test !any(==("JSONL parse error (skip)"), logger.messages)
     end
 end
 
