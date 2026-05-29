@@ -1,6 +1,6 @@
 name = "XPostCollector"
 uuid = "db9dce3e-f0f0-43fa-927a-c00bbfc647da"
-version = "0.0.2"
+version = "0.0.3"
 authors = ["Nakajima, Yukihiro <yukihiro@sfc.keio.ac.jp>"]
 
 [deps]
