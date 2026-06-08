@@ -846,17 +846,29 @@ end
                         Vector{UInt8}[
                             bytes[1:split_at],
                             UInt8[],
+                            UInt8[],
                             bytes[(split_at + 1):end],
                         ],
                     )
                     activity = Ref(false)
-                    outcome = _read_stream_lines!(cfg, st, sdb, io, stream, time(), activity)
+                    sleep_calls = Ref(0)
+                    outcome = _read_stream_lines!(
+                        cfg,
+                        st,
+                        sdb,
+                        io,
+                        stream,
+                        time(),
+                        activity;
+                        sleep_fn = _ -> (sleep_calls[] += 1),
+                    )
                     @test outcome.kind == :completed
                     @test outcome.stop_reason == "max_posts"
                     @test outcome.activity == true
                     @test activity[] == true
                     @test st.total_tweets == 1
-                    @test stream.calls == 3
+                    @test stream.calls == 4
+                    @test sleep_calls[] == 2
                 end
             finally
                 DBInterface.close!(sdb.db)
@@ -864,6 +876,44 @@ end
             lines = readlines(out_jsonl(cfg))
             @test count(ln -> occursin("\"kind\":\"tweet\"", ln), lines) == 1
             @test count(ln -> occursin("\"endpoint\":\"stream\"", ln), lines) == 1
+        end
+    end
+
+    with_temp_stream_cfg(task = "stream_empty_non_eof_max_seconds") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.max_seconds = 1
+            st = StreamState()
+            st.task_name = cfg.task_name
+            st.query = build_query(cfg)
+            st.rule_tag = cfg.rule_tag
+            sdb = init_seen_db(cfg)
+            try
+                open(out_jsonl(cfg), "w") do io
+                    stream = FakeEmptyNonEofStream()
+                    activity = Ref(false)
+                    sleep_calls = Ref(0)
+                    outcome = _read_stream_lines!(
+                        cfg,
+                        st,
+                        sdb,
+                        io,
+                        stream,
+                        time() - 2,
+                        activity;
+                        sleep_fn = _ -> (sleep_calls[] += 1),
+                    )
+                    @test outcome.kind == :completed
+                    @test outcome.stop_reason == "max_seconds"
+                    @test outcome.activity == false
+                    @test st.completed == true
+                    @test st.stop_reason == "max_seconds"
+                    @test stream.calls == 1
+                    @test sleep_calls[] == 0
+                end
+            finally
+                DBInterface.close!(sdb.db)
+            end
+            @test readlines(out_jsonl(cfg)) == String[]
         end
     end
 

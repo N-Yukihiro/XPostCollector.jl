@@ -12,6 +12,7 @@ function _open_stream_connection!(
     state_flush_ref::Base.RefValue{Float64},
     activity_this_connection::Base.RefValue{Bool};
     open_http = HTTP.open,
+    sleep_fn::Function = sleep,
 )::StreamOutcome
     outcome_ref = Ref{Union{Nothing,StreamOutcome}}(nothing)
     open_http(
@@ -67,6 +68,7 @@ function _open_stream_connection!(
             started_at,
             activity_this_connection,
             state_flush_ref,
+            sleep_fn = sleep_fn,
         )
         return nothing
     end
@@ -162,6 +164,7 @@ function run_stream_collector(
                     state_flush_ref,
                     activity_this_connection;
                     open_http = open_http,
+                    sleep_fn = sleep_fn,
                 )
 
                 if st.completed

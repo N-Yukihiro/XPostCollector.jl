@@ -234,6 +234,19 @@ end
 
 Base.eof(s::FakeReadavailableEofStream) = isempty(s.chunks)
 
+mutable struct FakeEmptyNonEofStream
+    calls::Int
+end
+
+FakeEmptyNonEofStream() = FakeEmptyNonEofStream(0)
+
+function Base.readavailable(s::FakeEmptyNonEofStream)
+    s.calls += 1
+    return UInt8[]
+end
+
+Base.eof(::FakeEmptyNonEofStream) = false
+
 struct FailingIO <: IO end
 Base.write(::FailingIO, ::UInt8) = error("write failed")
 Base.write(::FailingIO, ::StridedVector{UInt8}) = error("write failed")

@@ -7,6 +7,8 @@ struct StreamOutcome
     error::String
 end
 
+const STREAM_EMPTY_READ_SLEEP_SECONDS = 0.01
+
 function StreamOutcome(;
     kind::Symbol,
     stop_reason::AbstractString = "",
@@ -427,6 +429,9 @@ function _read_stream_response_lines!(
     started_at::Float64,
     activity_ref::Base.RefValue{Bool},
     state_flush_ref::Base.RefValue{Float64} = Ref(time()),
+    ;
+    empty_read_sleep_seconds::Real = STREAM_EMPTY_READ_SLEEP_SECONDS,
+    sleep_fn::Function = sleep,
 )
     stream = _stream_body_reader(resp, http)
     try
@@ -439,6 +444,8 @@ function _read_stream_response_lines!(
             started_at,
             activity_ref,
             state_flush_ref,
+            empty_read_sleep_seconds = empty_read_sleep_seconds,
+            sleep_fn = sleep_fn,
         )
     finally
         if stream !== http
@@ -456,6 +463,24 @@ function _stream_reader_eof_or_unknown(stream)::Bool
     catch
         return true
     end
+end
+
+function _stream_empty_read_outcome!(
+    cfg::StreamConfig,
+    st::StreamState,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64},
+)
+    stop_reason = _stream_stop_reason(cfg, st, started_at)
+    if stop_reason !== nothing
+        st.completed = true
+        st.stop_reason = stop_reason
+        _persist_stream_state!(cfg, st)
+        return _stream_completed_outcome(stop_reason, activity_ref)
+    end
+    _maybe_persist_stream_state!(cfg, st, state_flush_ref)
+    return nothing
 end
 
 function _flush_pending_stream_outcome!(
@@ -492,6 +517,9 @@ function _read_stream_lines!(
     started_at::Float64,
     activity_ref::Base.RefValue{Bool},
     state_flush_ref::Base.RefValue{Float64} = Ref(time()),
+    ;
+    empty_read_sleep_seconds::Real = STREAM_EMPTY_READ_SLEEP_SECONDS,
+    sleep_fn::Function = sleep,
 )
     pending_line = IOBuffer()
     try
@@ -499,7 +527,15 @@ function _read_stream_lines!(
             chunk = readavailable(http)
             if isempty(chunk)
                 if !_stream_reader_eof_or_unknown(http)
-                    yield()
+                    outcome = _stream_empty_read_outcome!(
+                        cfg,
+                        st,
+                        started_at,
+                        activity_ref,
+                        state_flush_ref,
+                    )
+                    outcome !== nothing && return outcome
+                    sleep_fn(empty_read_sleep_seconds)
                     continue
                 end
                 outcome = _flush_pending_stream_outcome!(
