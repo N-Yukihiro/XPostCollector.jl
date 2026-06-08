@@ -1,9 +1,98 @@
-function run_stream_collector(cfg::StreamConfig)
+function _open_stream_connection!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    writer::StreamJsonlWriter,
+    url::AbstractString,
+    headers,
+    params::Dict{String,String},
+    started_at::Float64,
+    pending_gap_start::Base.RefValue{Union{Nothing,String}},
+    pending_gap_reason::Base.RefValue{String},
+    state_flush_ref::Base.RefValue{Float64},
+    activity_this_connection::Base.RefValue{Bool};
+    open_http = HTTP.open,
+    sleep_fn::Function = sleep,
+)::StreamOutcome
+    outcome_ref = Ref{Union{Nothing,StreamOutcome}}(nothing)
+    open_http(
+        :GET,
+        url,
+        headers;
+        query = params,
+        status_exception = false,
+        readtimeout = cfg.idle_timeout_seconds,
+        decompress = false,
+    ) do http
+        resp = HTTP.startread(http)
+        if resp.status != 200
+            body =
+                resp.status == 429 || 500 <= resp.status < 600 ? "" :
+                _stream_response_body(resp, http)
+            status_outcome = _stream_response_outcome(resp, url; body = body)
+            if status_outcome.stop_reason == "rate_limited"
+                @warn "Stream rate limited" sleep_seconds =
+                    status_outcome.sleep_seconds
+            elseif status_outcome.stop_reason == "server_error"
+                @warn "Stream server error" status = resp.status
+            end
+            outcome_ref[] = status_outcome
+            return nothing
+        end
+
+        connected_at = stream_now_utc()
+        st.last_connected_at = connected_at
+        st.last_status = 200
+        st.last_error = ""
+        _finish_stream_gap!(
+            cfg,
+            st,
+            pending_gap_start,
+            pending_gap_reason,
+            connected_at,
+        )
+        _maybe_persist_stream_state!(
+            cfg,
+            st,
+            state_flush_ref;
+            force = true,
+        )
+
+        outcome_ref[] = _read_stream_response_lines!(
+            cfg,
+            st,
+            sdb,
+            writer,
+            resp,
+            http,
+            started_at,
+            activity_this_connection,
+            state_flush_ref,
+            sleep_fn = sleep_fn,
+        )
+        return nothing
+    end
+
+    outcome = outcome_ref[]
+    outcome === nothing && error("Stream connection closed before an outcome was recorded")
+    return outcome
+end
+
+function run_stream_collector(
+    cfg::StreamConfig;
+    open_http = HTTP.open,
+    sleep_fn = sleep,
+    rand_fn = rand,
+)
     validate!(cfg)
     mkpath(cfg.out_dir)
 
-    headers = bearer_headers(user_agent = "julia-x-collector/stream")
-    rule = ensure_stream_rule!(cfg, headers)
+    rule_headers = bearer_headers(user_agent = "julia-x-collector/stream")
+    stream_headers = bearer_headers(
+        user_agent = "julia-x-collector/stream",
+        accept_encoding = "identity",
+    )
+    rule = ensure_stream_rule!(cfg, rule_headers)
     query = build_query(cfg)
     sdb = init_seen_db(cfg)
 
@@ -61,59 +150,22 @@ function run_stream_collector(cfg::StreamConfig)
 
             activity_this_connection = Ref(false)
             try
-                outcome = HTTP.open(
-                    :GET,
+                outcome = _open_stream_connection!(
+                    cfg,
+                    st,
+                    sdb,
+                    writer[]::StreamJsonlWriter,
                     url,
-                    headers;
-                    query = params,
-                    status_exception = false,
-                    readtimeout = cfg.idle_timeout_seconds,
-                ) do http
-                    resp = HTTP.startread(http)
-                    if resp.status != 200
-                        body =
-                            resp.status == 429 || 500 <= resp.status < 600 ? "" :
-                            _stream_response_body(resp, http)
-                        status_outcome =
-                            _stream_response_outcome(resp, url; body = body)
-                        if status_outcome.stop_reason == "rate_limited"
-                            @warn "Stream rate limited" sleep_seconds =
-                                status_outcome.sleep_seconds
-                        elseif status_outcome.stop_reason == "server_error"
-                            @warn "Stream server error" status = resp.status
-                        end
-                        return status_outcome
-                    end
-
-                    connected_at = stream_now_utc()
-                    st.last_connected_at = connected_at
-                    st.last_status = 200
-                    st.last_error = ""
-                    _finish_stream_gap!(
-                        cfg,
-                        st,
-                        pending_gap_start,
-                        pending_gap_reason,
-                        connected_at,
-                    )
-                    _maybe_persist_stream_state!(
-                        cfg,
-                        st,
-                        state_flush_ref;
-                        force = true,
-                    )
-
-                    return _read_stream_lines!(
-                        cfg,
-                        st,
-                        sdb,
-                        writer[]::StreamJsonlWriter,
-                        http,
-                        started_at,
-                        activity_this_connection,
-                        state_flush_ref,
-                    )
-                end
+                    stream_headers,
+                    params,
+                    started_at,
+                    pending_gap_start,
+                    pending_gap_reason,
+                    state_flush_ref,
+                    activity_this_connection;
+                    open_http = open_http,
+                    sleep_fn = sleep_fn,
+                )
 
                 if st.completed
                     break
@@ -127,7 +179,7 @@ function run_stream_collector(cfg::StreamConfig)
 
                 if !isempty(outcome.stop_reason)
                     st.stop_reason = outcome.stop_reason
-                    st.last_status = outcome.status
+                    outcome.status > 0 && (st.last_status = outcome.status)
                     st.last_error = outcome.error
                     if outcome.kind in (:retryable, :disconnected)
                         _begin_stream_gap!(
@@ -164,8 +216,8 @@ function run_stream_collector(cfg::StreamConfig)
                 state_flush_ref[] = time()
                 sleep_seconds =
                     outcome.sleep_seconds > 0 ? outcome.sleep_seconds :
-                    delay + rand() * 0.5
-                sleep(sleep_seconds)
+                    delay + rand_fn() * 0.5
+                sleep_fn(sleep_seconds)
                 delay = min(delay * 1.8, cfg.reconnect_max_delay_seconds)
 
             catch e
@@ -272,7 +324,7 @@ function run_stream_collector(cfg::StreamConfig)
                 end
                 _persist_stream_state!(cfg, st)
                 state_flush_ref[] = time()
-                sleep(delay + rand() * 0.5)
+                sleep_fn(delay + rand_fn() * 0.5)
                 delay = min(delay * 1.8, cfg.reconnect_max_delay_seconds)
             end
         end

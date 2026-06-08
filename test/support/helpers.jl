@@ -218,6 +218,35 @@ function Base.readavailable(s::FakeReadavailableStream)
     return popfirst!(s.chunks)
 end
 
+mutable struct FakeReadavailableEofStream
+    chunks::Vector{Vector{UInt8}}
+    calls::Int
+end
+
+FakeReadavailableEofStream(chunks::Vector{Vector{UInt8}}) =
+    FakeReadavailableEofStream(chunks, 0)
+
+function Base.readavailable(s::FakeReadavailableEofStream)
+    s.calls += 1
+    isempty(s.chunks) && return UInt8[]
+    return popfirst!(s.chunks)
+end
+
+Base.eof(s::FakeReadavailableEofStream) = isempty(s.chunks)
+
+mutable struct FakeEmptyNonEofStream
+    calls::Int
+end
+
+FakeEmptyNonEofStream() = FakeEmptyNonEofStream(0)
+
+function Base.readavailable(s::FakeEmptyNonEofStream)
+    s.calls += 1
+    return UInt8[]
+end
+
+Base.eof(::FakeEmptyNonEofStream) = false
+
 struct FailingIO <: IO end
 Base.write(::FailingIO, ::UInt8) = error("write failed")
 Base.write(::FailingIO, ::StridedVector{UInt8}) = error("write failed")

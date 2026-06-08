@@ -1,10 +1,16 @@
 # =========================================================
 # Filtered Stream
 # =========================================================
-function bearer_headers(; user_agent::AbstractString = "julia-x-collector/repl")
+function bearer_headers(;
+    user_agent::AbstractString = "julia-x-collector/repl",
+    accept_encoding::Union{Nothing,AbstractString} = nothing,
+)
     token = get(ENV, "BEARER_TOKEN", "")
     isempty(token) && error("BEARER_TOKEN is missing (env/.env)")
-    return ["Authorization" => "Bearer $token", "User-Agent" => String(user_agent)]
+    headers = ["Authorization" => "Bearer $token", "User-Agent" => String(user_agent)]
+    accept_encoding !== nothing &&
+        push!(headers, "Accept-Encoding" => String(accept_encoding))
+    return headers
 end
 
 function fetch_stream_json_with_retry(
