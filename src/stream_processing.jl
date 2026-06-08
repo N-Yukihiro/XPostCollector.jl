@@ -1,3 +1,30 @@
+struct StreamOutcome
+    kind::Symbol
+    stop_reason::String
+    sleep_seconds::Float64
+    activity::Bool
+    status::Int
+    error::String
+end
+
+function StreamOutcome(;
+    kind::Symbol,
+    stop_reason::AbstractString = "",
+    sleep_seconds::Real = 0,
+    activity::Bool = false,
+    status::Integer = 0,
+    error::AbstractString = "",
+)
+    return StreamOutcome(
+        kind,
+        String(stop_reason),
+        Float64(sleep_seconds),
+        activity,
+        Int(status),
+        String(error),
+    )
+end
+
 function _stream_line_payload(line::AbstractString)::Union{Nothing,String}
     s = strip(String(line))
     isempty(s) && return nothing
@@ -250,7 +277,7 @@ end
 
 function _stream_response_outcome(resp, url::AbstractString; body::AbstractString = "")
     resp.status == 200 &&
-        return (
+        return StreamOutcome(
             kind = :ok,
             stop_reason = "",
             sleep_seconds = 0,
@@ -259,7 +286,7 @@ function _stream_response_outcome(resp, url::AbstractString; body::AbstractStrin
             error = "",
         )
     if resp.status == 429
-        return (
+        return StreamOutcome(
             kind = :retryable,
             stop_reason = "rate_limited",
             sleep_seconds = rate_limit_sleep_seconds(resp),
@@ -268,7 +295,7 @@ function _stream_response_outcome(resp, url::AbstractString; body::AbstractStrin
             error = "rate limited",
         )
     elseif 500 <= resp.status < 600
-        return (
+        return StreamOutcome(
             kind = :retryable,
             stop_reason = "server_error",
             sleep_seconds = 0,
@@ -365,23 +392,71 @@ function _flush_pending_stream_line!(
     )
 end
 
-_stream_completed_outcome(stop_reason::AbstractString, activity_ref::Base.RefValue{Bool}) = (
-    kind = :completed,
-    stop_reason = String(stop_reason),
-    sleep_seconds = 0,
-    activity = activity_ref[],
-    status = 0,
-    error = "",
-)
+_stream_completed_outcome(stop_reason::AbstractString, activity_ref::Base.RefValue{Bool}) =
+    StreamOutcome(
+        kind = :completed,
+        stop_reason = stop_reason,
+        sleep_seconds = 0,
+        activity = activity_ref[],
+        status = 0,
+        error = "",
+    )
 
-_stream_disconnected_outcome(activity_ref::Base.RefValue{Bool}) = (
-    kind = :disconnected,
-    stop_reason = "disconnected",
-    sleep_seconds = 0,
-    activity = activity_ref[],
-    status = 0,
-    error = "",
+_stream_disconnected_outcome(activity_ref::Base.RefValue{Bool}) =
+    StreamOutcome(
+        kind = :disconnected,
+        stop_reason = "disconnected",
+        sleep_seconds = 0,
+        activity = activity_ref[],
+        status = 0,
+        error = "",
+    )
+
+function _stream_body_reader(resp, http)
+    encoding = _ascii_lowercase_text(_response_content_encoding(resp))
+    return occursin("gzip", encoding) ? HTTP.GzipDecompressorStream(http) : http
+end
+
+function _read_stream_response_lines!(
+    cfg::StreamConfig,
+    st::StreamState,
+    sdb::SeenDB,
+    sink,
+    resp,
+    http,
+    started_at::Float64,
+    activity_ref::Base.RefValue{Bool},
+    state_flush_ref::Base.RefValue{Float64} = Ref(time()),
 )
+    stream = _stream_body_reader(resp, http)
+    try
+        return _read_stream_lines!(
+            cfg,
+            st,
+            sdb,
+            sink,
+            stream,
+            started_at,
+            activity_ref,
+            state_flush_ref,
+        )
+    finally
+        if stream !== http
+            try
+                close(stream)
+            catch
+            end
+        end
+    end
+end
+
+function _stream_reader_eof_or_unknown(stream)::Bool
+    try
+        return eof(stream)
+    catch
+        return true
+    end
+end
 
 function _flush_pending_stream_outcome!(
     cfg::StreamConfig,
@@ -423,6 +498,10 @@ function _read_stream_lines!(
         while true
             chunk = readavailable(http)
             if isempty(chunk)
+                if !_stream_reader_eof_or_unknown(http)
+                    yield()
+                    continue
+                end
                 outcome = _flush_pending_stream_outcome!(
                     cfg,
                     st,

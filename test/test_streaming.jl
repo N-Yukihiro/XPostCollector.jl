@@ -321,6 +321,94 @@ end
     @test disabled.stop_reason == ""
 end
 
+@testset "run_stream_collector retries 503 without response/outcome confusion" begin
+    with_temp_stream_cfg(task = "stream_503_retry") do cfg, dir
+        with_env_token() do
+            with_logger(NullLogger()) do
+                cfg.manage_rules = false
+                cfg.max_posts = 1
+                cfg.max_reconnects = 1
+                attempts = Ref(0)
+                server = HTTP.serve!(listenany = true) do req
+                    if startswith(String(req.target), "/2/tweets/search/stream")
+                        attempts[] += 1
+                        if attempts[] == 1
+                            return HTTP.Response(503)
+                        end
+                        return HTTP.Response(
+                            200,
+                            ["Content-Type" => "application/json"],
+                            stream_event_json("after-503") * "\n",
+                        )
+                    end
+                    return HTTP.Response(404)
+                end
+                try
+                    cfg.api_base_url = "http://127.0.0.1:$(HTTP.port(server))"
+                    st = run_stream_collector(
+                        cfg;
+                        sleep_fn = _ -> nothing,
+                        rand_fn = () -> 0.0,
+                    )
+                    @test attempts[] == 2
+                    @test st.total_tweets == 1
+                    @test st.completed == true
+                    @test st.stop_reason == "max_posts"
+                    @test st.last_status == 200
+                    gaps = readlines(out_stream_gaps(cfg))
+                    @test length(gaps) == 1
+                    @test JSON3.read(gaps[1])["reason"] == "server_error"
+                finally
+                    close(server)
+                end
+            end
+        end
+    end
+end
+
+@testset "run_stream_collector requests identity and handles gzip stream body" begin
+    with_temp_stream_cfg(task = "stream_gzip_body") do cfg, dir
+        with_env_token() do
+            with_logger(NullLogger()) do
+                cfg.manage_rules = false
+                cfg.max_posts = 1
+                seen_accept_encoding = Ref("")
+                server = HTTP.serve!(listenany = true) do req
+                    if startswith(String(req.target), "/2/tweets/search/stream")
+                        seen_accept_encoding[] = HTTP.header(req, "Accept-Encoding")
+                        return HTTP.Response(
+                            200,
+                            [
+                                "Content-Type" => "application/json",
+                                "Content-Encoding" => "gzip",
+                            ],
+                            gzip_bytes(stream_event_json("gzip-stream") * "\n"),
+                        )
+                    end
+                    return HTTP.Response(404)
+                end
+                try
+                    cfg.api_base_url = "http://127.0.0.1:$(HTTP.port(server))"
+                    st = run_stream_collector(
+                        cfg;
+                        sleep_fn = _ -> nothing,
+                        rand_fn = () -> 0.0,
+                    )
+                    @test seen_accept_encoding[] == "identity"
+                    @test st.total_tweets == 1
+                    @test st.completed == true
+                    @test st.stop_reason == "max_posts"
+                    lines = readlines(out_jsonl(cfg))
+                    @test count(ln -> occursin("\"kind\":\"tweet\"", ln), lines) == 1
+                    @test count(ln -> occursin("\"endpoint\":\"stream\"", ln), lines) == 1
+                finally
+                    close(server)
+                end
+            end
+        end
+    end
+end
+
 @testset "handle_stream_line! writes reusable JSONL and deduplicates" begin
     with_temp_stream_cfg(task = "stream_lines") do cfg, dir
         with_logger(NullLogger()) do
@@ -724,6 +812,51 @@ end
                     @test activity[] == true
                     @test st.total_tweets == 1
                     @test stream.calls == 2
+                end
+            finally
+                DBInterface.close!(sdb.db)
+            end
+            lines = readlines(out_jsonl(cfg))
+            @test count(ln -> occursin("\"kind\":\"tweet\"", ln), lines) == 1
+            @test count(ln -> occursin("\"endpoint\":\"stream\"", ln), lines) == 1
+        end
+    end
+
+    with_temp_stream_cfg(task = "stream_empty_non_eof_after_pending") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.max_posts = 1
+            st = StreamState()
+            st.task_name = cfg.task_name
+            st.query = build_query(cfg)
+            st.rule_tag = cfg.rule_tag
+            sdb = init_seen_db(cfg)
+            try
+                open(out_jsonl(cfg), "w") do io
+                    tweet = Dict(
+                        "id" => "302",
+                        "created_at" => "2026-01-01T00:00:00Z",
+                        "author_id" => "32",
+                        "lang" => "ja",
+                        "text" => "pending across empty non-eof",
+                    )
+                    event = String(JSON3.write(Dict("data" => tweet))) * "\n"
+                    bytes = collect(codeunits(event))
+                    split_at = max(1, length(bytes) ÷ 2)
+                    stream = FakeReadavailableEofStream(
+                        Vector{UInt8}[
+                            bytes[1:split_at],
+                            UInt8[],
+                            bytes[(split_at + 1):end],
+                        ],
+                    )
+                    activity = Ref(false)
+                    outcome = _read_stream_lines!(cfg, st, sdb, io, stream, time(), activity)
+                    @test outcome.kind == :completed
+                    @test outcome.stop_reason == "max_posts"
+                    @test outcome.activity == true
+                    @test activity[] == true
+                    @test st.total_tweets == 1
+                    @test stream.calls == 3
                 end
             finally
                 DBInterface.close!(sdb.db)
