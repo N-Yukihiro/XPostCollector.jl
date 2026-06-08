@@ -38,12 +38,21 @@
                 urls = String[]
                 calls = Ref(0)
 
-                fetch_stub =
-                    (url, _headers, _params) -> begin
-                        push!(urls, url)
+                request_stub =
+                    (
+                        method,
+                        url;
+                        headers = nothing,
+                        query = Dict{String,String}(),
+                        body = UInt8[],
+                        status_exception = true,
+                        readtimeout = 30,
+                    ) -> begin
+                        @test method == "GET"
+                        push!(urls, String(url))
                         calls[] += 1
                         if calls[] == 1
-                            return Dict(
+                            obj = Dict(
                                 "data" => Any[
                                     Dict(
                                         "id" => "1",
@@ -63,8 +72,9 @@
                                 "meta" =>
                                     Dict("next_token" => "N1", "result_count" => 2),
                             )
+                            return HTTP.Response(200, String(JSON3.write(obj)))
                         elseif calls[] == 2
-                            return Dict(
+                            obj = Dict(
                                 "data" => Any[
                                     Dict(
                                         "id" => "3",
@@ -84,22 +94,20 @@
                                 "meta" =>
                                     Dict("next_token" => "N2", "result_count" => 2),
                             )
+                            return HTTP.Response(200, String(JSON3.write(obj)))
                         end
-                        return Dict("data" => Any[], "meta" => Dict("result_count" => 0))
+                        obj = Dict("data" => Any[], "meta" => Dict("result_count" => 0))
+                        return HTTP.Response(200, String(JSON3.write(obj)))
                     end
 
-                @eval XPostCollector begin
-                    function fetch_with_retry(
-                        url::AbstractString,
-                        headers,
-                        params::Dict{String,String};
-                        max_retries::Int = 6,
-                    )
-                        return $fetch_stub(String(url), headers, params)
-                    end
-                end
+                client = XApiClient(
+                    bearer_token = "dummy",
+                    request_fn = request_stub,
+                    sleep_fn = _ -> nothing,
+                    rand_fn = () -> 0.0,
+                )
 
-                st = Base.invokelatest(run_collector, cfg)
+                st = run_collector(cfg; client = client)
 
                 @test length(urls) == 2
                 @test occursin("/2/tweets/search/all", urls[1])

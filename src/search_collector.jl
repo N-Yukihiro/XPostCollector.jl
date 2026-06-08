@@ -23,14 +23,11 @@ build_search_params(
     return params
 end
 
-function run_collector(cfg::SearchConfig)
+function run_collector(cfg::SearchConfig; client::XApiClient = XApiClient())
     validate!(cfg)
     mkpath(cfg.out_dir)
 
-    token = get(ENV, "BEARER_TOKEN", "")
-    isempty(token) && error("BEARER_TOKEN is missing (env/.env)")
-
-    headers = ["Authorization" => "Bearer $token", "User-Agent" => "julia-x-collector/repl"]
+    headers = bearer_headers(client; user_agent = "julia-x-collector/repl")
 
     st = load_state(out_state(cfg))
     prev_conv_offset = st === nothing ? 0 : st.converted_jsonl_offset
@@ -128,7 +125,7 @@ function run_collector(cfg::SearchConfig)
                     st2.total_tweets
 
                 res = try
-                    fetch_with_retry(url, headers, params)
+                    fetch_with_retry(client, url, headers, params)
                 catch e
                     if e isa InvalidPaginationTokenError
                         @warn "Invalid pagination token; stopping gracefully" exception = e
@@ -209,7 +206,7 @@ function run_collector(cfg::SearchConfig)
 
                 if cfg.usage_check_every_pages > 0
                     try
-                        usage = maybe_check_usage(cfg, headers, st2)
+                        usage = maybe_check_usage(cfg, client, headers, st2)
                         if usage !== nothing &&
                            cfg.drain_to_cap &&
                            !ismissing(usage.remaining) &&

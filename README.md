@@ -32,6 +32,15 @@ On PowerShell:
 $env:BEARER_TOKEN = "..."
 ```
 
+You can also pass an explicit client when you do not want to read the token from
+the environment, or when tests need to inject fake HTTP behavior:
+
+```julia
+client = XApiClient(bearer_token = "...")
+run_collector(cfg; client = client)
+run_stream_collector(stream_cfg; client = client)
+```
+
 ## REST search collection
 
 Use `SearchConfig` with `run_collector` for recent search or full-archive search.

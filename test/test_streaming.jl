@@ -318,7 +318,7 @@ end
     @test limited.kind == :retryable
     @test limited.stop_reason == "rate_limited"
     @test limited.sleep_seconds == 60
-    @test limited.retry_after == 1
+    @test limited.diagnostics.retry_after == 1
 
     usage_body = """{"type":"https://api.x.com/2/problems/usage-capped","detail":"Usage cap exceeded"}"""
     usage = _stream_response_outcome(
@@ -335,11 +335,13 @@ end
         body = usage_body,
     )
     @test usage.stop_reason == "usage_capped"
-    @test usage.error_type == "https://api.x.com/2/problems/usage-capped"
-    @test usage.error_detail == "Usage cap exceeded"
-    @test usage.rate_limit_limit == 50
-    @test usage.rate_limit_remaining == 0
-    @test usage.rate_limit_reset == 123
+    @test usage.kind == :terminal
+    @test usage.sleep_seconds == 0
+    @test usage.diagnostics.error_type == "https://api.x.com/2/problems/usage-capped"
+    @test usage.diagnostics.error_detail == "Usage cap exceeded"
+    @test usage.diagnostics.rate_limit_limit == 50
+    @test usage.diagnostics.rate_limit_remaining == 0
+    @test usage.diagnostics.rate_limit_reset == 123
 
     server = _stream_response_outcome(HTTP.Response(503), "http://x.test")
     @test server.kind == :retryable
@@ -372,6 +374,65 @@ end
     disabled = _stream_reconnect_decision(cfg, 0)
     @test disabled.should_reconnect == false
     @test disabled.stop_reason == ""
+end
+
+@testset "run_stream_collector stops terminal usage cap without reconnecting" begin
+    with_temp_stream_cfg(task = "stream_usage_capped") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.manage_rules = false
+            cfg.max_posts = 1
+            cfg.max_reconnects = 0
+            attempts = Ref(0)
+            sleep_calls = Ref(0)
+            fake_open_http =
+                (
+                    callback,
+                    method,
+                    url,
+                    headers;
+                    query = nothing,
+                    status_exception = true,
+                    readtimeout = -1,
+                    decompress = nothing,
+                ) -> begin
+                    attempts[] += 1
+                    response = HTTP.Response(
+                        429,
+                        [
+                            "retry-after" => "5",
+                            "x-rate-limit-limit" => "50",
+                            "x-rate-limit-remaining" => "0",
+                            "x-rate-limit-reset" => "123",
+                        ],
+                    )
+                    body = """{"type":"https://api.x.com/2/problems/usage-capped","detail":"Usage cap exceeded"}"""
+                    return callback(FakeHTTPStream(response, [collect(codeunits(body))]))
+                end
+
+            client = XApiClient(
+                bearer_token = "dummy",
+                open_fn = fake_open_http,
+                sleep_fn = _ -> (sleep_calls[] += 1),
+                rand_fn = () -> 0.0,
+            )
+            st = run_stream_collector(cfg; client = client)
+
+            @test attempts[] == 1
+            @test sleep_calls[] == 0
+            @test st.completed == false
+            @test st.stop_reason == "usage_capped"
+            @test st.diagnostics.status == 429
+            @test st.diagnostics.error_type == "https://api.x.com/2/problems/usage-capped"
+            @test st.diagnostics.retry_after == 5
+            gaps = readlines(out_stream_gaps(cfg))
+            @test length(gaps) == 1
+            gap = JSON3.read(gaps[1])
+            @test gap["reason"] == "usage_capped"
+            @test gap["status"] == 429
+            @test gap["error_type"] == "https://api.x.com/2/problems/usage-capped"
+            @test gap["retry_after"] == 5
+        end
+    end
 end
 
 @testset "stream rate limit diagnostics are persisted in gap records" begin
@@ -551,7 +612,7 @@ end
                 )
                 @test attempts[] == 2
                 @test st.total_tweets == 1
-                @test st.last_status == 200
+                @test st.diagnostics.status == 200
                 gaps = readlines(out_stream_gaps(cfg))
                 @test length(gaps) == 1
                 gap = JSON3.read(gaps[1])
@@ -610,7 +671,7 @@ end
                 )
                 @test attempts[] == 2
                 @test st.total_tweets == 1
-                @test st.last_status == 200
+                @test st.diagnostics.status == 200
                 gaps = readlines(out_stream_gaps(cfg))
                 @test length(gaps) == 1
                 gap = JSON3.read(gaps[1])
@@ -663,7 +724,7 @@ end
                 )
                 @test attempts[] == 2
                 @test st.total_tweets == 1
-                @test st.last_status == 200
+                @test st.diagnostics.status == 200
                 gaps = readlines(out_stream_gaps(cfg))
                 @test length(gaps) == 1
                 gap = JSON3.read(gaps[1])
@@ -709,7 +770,7 @@ end
                     @test st.total_tweets == 1
                     @test st.completed == true
                     @test st.stop_reason == "max_posts"
-                    @test st.last_status == 200
+                    @test st.diagnostics.status == 200
                     gaps = readlines(out_stream_gaps(cfg))
                     @test length(gaps) == 1
                     @test JSON3.read(gaps[1])["reason"] == "server_error"

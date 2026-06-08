@@ -3,35 +3,41 @@ struct StreamOutcome
     stop_reason::String
     sleep_seconds::Float64
     activity::Bool
-    status::Int
-    error::String
-    error_type::String
-    error_detail::String
-    rate_limit_limit::Int
-    rate_limit_remaining::Int
-    rate_limit_reset::Int
-    retry_after::Int
+    diagnostics::StreamDiagnostics
 end
 
 Base.@kwdef mutable struct StreamGapSnapshot
     start_time_utc::Union{Nothing,String} = nothing
     reason::String = ""
-    status::Int = 0
-    error_type::String = ""
-    error_detail::String = ""
-    rate_limit_limit::Int = 0
-    rate_limit_remaining::Int = 0
-    rate_limit_reset::Int = 0
-    retry_after::Int = 0
+    diagnostics::StreamDiagnostics = StreamDiagnostics()
 end
 
 const STREAM_EMPTY_READ_SLEEP_SECONDS = 0.01
+
+function _copy_stream_diagnostics(diag::StreamDiagnostics)
+    return StreamDiagnostics(
+        error = diag.error,
+        status = diag.status,
+        error_type = diag.error_type,
+        error_detail = diag.error_detail,
+        rate_limit_limit = diag.rate_limit_limit,
+        rate_limit_remaining = diag.rate_limit_remaining,
+        rate_limit_reset = diag.rate_limit_reset,
+        retry_after = diag.retry_after,
+    )
+end
+
+function _clear_stream_diagnostics!(st::StreamState)
+    st.diagnostics = StreamDiagnostics()
+    return st
+end
 
 function StreamOutcome(;
     kind::Symbol,
     stop_reason::AbstractString = "",
     sleep_seconds::Real = 0,
     activity::Bool = false,
+    diagnostics::Union{Nothing,StreamDiagnostics} = nothing,
     status::Integer = 0,
     error::AbstractString = "",
     error_type::AbstractString = "",
@@ -46,14 +52,17 @@ function StreamOutcome(;
         String(stop_reason),
         Float64(sleep_seconds),
         activity,
-        Int(status),
-        String(error),
-        String(error_type),
-        String(error_detail),
-        Int(rate_limit_limit),
-        Int(rate_limit_remaining),
-        Int(rate_limit_reset),
-        Int(retry_after),
+        diagnostics === nothing ?
+        StreamDiagnostics(
+            error = String(error),
+            status = Int(status),
+            error_type = String(error_type),
+            error_detail = String(error_detail),
+            rate_limit_limit = Int(rate_limit_limit),
+            rate_limit_remaining = Int(rate_limit_remaining),
+            rate_limit_reset = Int(rate_limit_reset),
+            retry_after = Int(retry_after),
+        ) : _copy_stream_diagnostics(diagnostics),
     )
 end
 
@@ -247,21 +256,22 @@ function _write_stream_gap!(
         "reason" => String(reason),
         "recorded_at" => stream_now_utc(),
     )
-    !isempty(st.last_error_type) && (record["error_type"] = st.last_error_type)
-    !isempty(st.last_error_detail) && (record["error_detail"] = st.last_error_detail)
-    st.last_status > 0 && (record["status"] = st.last_status)
+    diag = st.diagnostics
+    !isempty(diag.error_type) && (record["error_type"] = diag.error_type)
+    !isempty(diag.error_detail) && (record["error_detail"] = diag.error_detail)
+    diag.status > 0 && (record["status"] = diag.status)
     has_rate_limit_diagnostics =
-        st.last_status == 429 ||
-        st.last_rate_limit_limit > 0 ||
-        st.last_rate_limit_reset > 0 ||
-        st.last_retry_after > 0
-    st.last_rate_limit_limit > 0 &&
-        (record["rate_limit_limit"] = st.last_rate_limit_limit)
+        diag.status == 429 ||
+        diag.rate_limit_limit > 0 ||
+        diag.rate_limit_reset > 0 ||
+        diag.retry_after > 0
+    diag.rate_limit_limit > 0 &&
+        (record["rate_limit_limit"] = diag.rate_limit_limit)
     has_rate_limit_diagnostics &&
-        (record["rate_limit_remaining"] = st.last_rate_limit_remaining)
-    st.last_rate_limit_reset > 0 &&
-        (record["rate_limit_reset"] = st.last_rate_limit_reset)
-    st.last_retry_after > 0 && (record["retry_after"] = st.last_retry_after)
+        (record["rate_limit_remaining"] = diag.rate_limit_remaining)
+    diag.rate_limit_reset > 0 &&
+        (record["rate_limit_reset"] = diag.rate_limit_reset)
+    diag.retry_after > 0 && (record["retry_after"] = diag.retry_after)
 
     mkpath(cfg.out_dir)
     open(out_stream_gaps(cfg), "a") do io
@@ -292,19 +302,20 @@ function _write_stream_gap!(
         "reason" => gap_reason,
         "recorded_at" => stream_now_utc(),
     )
-    !isempty(gap.error_type) && (record["error_type"] = gap.error_type)
-    !isempty(gap.error_detail) && (record["error_detail"] = gap.error_detail)
-    gap.status > 0 && (record["status"] = gap.status)
+    diag = gap.diagnostics
+    !isempty(diag.error_type) && (record["error_type"] = diag.error_type)
+    !isempty(diag.error_detail) && (record["error_detail"] = diag.error_detail)
+    diag.status > 0 && (record["status"] = diag.status)
     has_rate_limit_diagnostics =
-        gap.status == 429 ||
-        gap.rate_limit_limit > 0 ||
-        gap.rate_limit_reset > 0 ||
-        gap.retry_after > 0
-    gap.rate_limit_limit > 0 && (record["rate_limit_limit"] = gap.rate_limit_limit)
+        diag.status == 429 ||
+        diag.rate_limit_limit > 0 ||
+        diag.rate_limit_reset > 0 ||
+        diag.retry_after > 0
+    diag.rate_limit_limit > 0 && (record["rate_limit_limit"] = diag.rate_limit_limit)
     has_rate_limit_diagnostics &&
-        (record["rate_limit_remaining"] = gap.rate_limit_remaining)
-    gap.rate_limit_reset > 0 && (record["rate_limit_reset"] = gap.rate_limit_reset)
-    gap.retry_after > 0 && (record["retry_after"] = gap.retry_after)
+        (record["rate_limit_remaining"] = diag.rate_limit_remaining)
+    diag.rate_limit_reset > 0 && (record["rate_limit_reset"] = diag.rate_limit_reset)
+    diag.retry_after > 0 && (record["retry_after"] = diag.retry_after)
 
     mkpath(cfg.out_dir)
     open(out_stream_gaps(cfg), "a") do io
@@ -320,13 +331,7 @@ function _stream_gap_snapshot(st::StreamState, start_time_utc, reason::AbstractS
     return StreamGapSnapshot(
         start_time_utc = start_time_utc,
         reason = String(reason),
-        status = st.last_status,
-        error_type = st.last_error_type,
-        error_detail = st.last_error_detail,
-        rate_limit_limit = st.last_rate_limit_limit,
-        rate_limit_remaining = st.last_rate_limit_remaining,
-        rate_limit_reset = st.last_rate_limit_reset,
-        retry_after = st.last_retry_after,
+        diagnostics = _copy_stream_diagnostics(st.diagnostics),
     )
 end
 
@@ -436,9 +441,10 @@ function _stream_response_outcome(resp, url::AbstractString; body::AbstractStrin
     if resp.status == 429
         stop_reason = _stream_429_stop_reason(meta)
         return StreamOutcome(
-            kind = :retryable,
+            kind = stop_reason == "usage_capped" ? :terminal : :retryable,
             stop_reason = stop_reason,
-            sleep_seconds = rate_limit_sleep_seconds(resp; min_backoff_seconds = 60),
+            sleep_seconds = stop_reason == "usage_capped" ? 0 :
+                            rate_limit_sleep_seconds(resp; min_backoff_seconds = 60),
             activity = false,
             status = resp.status,
             error = stop_reason == "usage_capped" ? "usage cap exceeded" : "rate limited",
@@ -469,14 +475,7 @@ function _stream_response_outcome(resp, url::AbstractString; body::AbstractStrin
 end
 
 function _record_stream_outcome_diagnostics!(st::StreamState, outcome::StreamOutcome)
-    outcome.status > 0 && (st.last_status = outcome.status)
-    st.last_error = outcome.error
-    st.last_error_type = outcome.error_type
-    st.last_error_detail = outcome.error_detail
-    st.last_rate_limit_limit = outcome.rate_limit_limit
-    st.last_rate_limit_remaining = outcome.rate_limit_remaining
-    st.last_rate_limit_reset = outcome.rate_limit_reset
-    st.last_retry_after = outcome.retry_after
+    st.diagnostics = _copy_stream_diagnostics(outcome.diagnostics)
     return st
 end
 
