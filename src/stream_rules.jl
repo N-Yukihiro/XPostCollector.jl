@@ -72,12 +72,82 @@ function fetch_stream_json_with_retry(
     error("Stream rules max retries exceeded")
 end
 
+function _stream_field_params(cfg::StreamConfig)
+    if cfg.field_profile === :full
+        params = copy(API_FIELDS)
+    elseif cfg.field_profile === :lean
+        params = copy(STREAM_LEAN_FIELDS)
+    else
+        params = copy(STREAM_MINIMAL_FIELDS)
+    end
+
+    if !cfg.write_includes
+        for key in ("expansions", "user.fields", "media.fields", "place.fields", "poll.fields")
+            pop!(params, key, nothing)
+        end
+    end
+    return params
+end
+
 build_stream_params(cfg::StreamConfig) = begin
     params = Dict{String,String}()
-    for (k, v) in API_FIELDS
+    for (k, v) in _stream_field_params(cfg)
         params[k] = v
     end
     return params
+end
+
+function list_stream_connections(
+    cfg::StreamConfig;
+    status::AbstractString = "active",
+    endpoints::AbstractString = "filtered_stream",
+    max_results::Integer = 10,
+)
+    validate!(cfg)
+    headers = bearer_headers(user_agent = "julia-x-collector/stream")
+    return list_stream_connections(
+        cfg,
+        headers;
+        status = status,
+        endpoints = endpoints,
+        max_results = max_results,
+    )
+end
+
+function list_stream_connections(
+    cfg::StreamConfig,
+    headers;
+    status::AbstractString = "active",
+    endpoints::AbstractString = "filtered_stream",
+    max_results::Integer = 10,
+)
+    return list_stream_connections(
+        cfg,
+        headers,
+        fetch_stream_json_with_retry;
+        status = status,
+        endpoints = endpoints,
+        max_results = max_results,
+    )
+end
+
+function list_stream_connections(
+    cfg::StreamConfig,
+    headers,
+    fetch_json::Function;
+    status::AbstractString = "active",
+    endpoints::AbstractString = "filtered_stream",
+    max_results::Integer = 10,
+)
+    validate!(cfg)
+    params = Dict{String,String}(
+        "status" => String(status),
+        "max_results" => string(clamp(Int(max_results), 1, 100)),
+        "connection.fields" => "id,endpoint_name,connected_at,disconnected_at,disconnect_reason,client_ip",
+    )
+    endpoint_filter = strip(String(endpoints))
+    !isempty(endpoint_filter) && (params["endpoints"] = endpoint_filter)
+    return fetch_json("GET", connections_url(cfg), headers, params)
 end
 
 function list_stream_rules(cfg::StreamConfig)

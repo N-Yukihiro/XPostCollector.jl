@@ -34,6 +34,12 @@ mutable struct StreamState
     last_event_at::String
     last_error::String
     last_status::Int
+    last_error_type::String
+    last_error_detail::String
+    last_rate_limit_limit::Int
+    last_rate_limit_remaining::Int
+    last_rate_limit_reset::Int
+    last_retry_after::Int
     consecutive_failures::Int
     last_connected_at::String
     last_disconnect_at::String
@@ -45,7 +51,35 @@ mutable struct StreamState
 end
 
 StreamState() =
-    StreamState("", "", "", nothing, "", 0, 0, 0, 0, "", "", "", 0, 0, "", "", 0, "", 0, false, "")
+    StreamState(
+        "",
+        "",
+        "",
+        nothing,
+        "",
+        0,
+        0,
+        0,
+        0,
+        "",
+        "",
+        "",
+        0,
+        "",
+        "",
+        0,
+        0,
+        0,
+        0,
+        0,
+        "",
+        "",
+        0,
+        "",
+        0,
+        false,
+        "",
+    )
 StructTypes.StructType(::Type{StreamState}) = StructTypes.Mutable()
 
 function atomic_write(path::AbstractString, bytes::Vector{UInt8})

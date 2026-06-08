@@ -73,10 +73,17 @@ using XPostCollector
 cfg = StreamConfig(
     task_name = "stream_weekly",
     keywords_or = ["Julia"],
+    extra_query_tail = "lang:ja",
     max_seconds = 0,
     max_posts = 0,
+    http_readtimeout_seconds = 0, # auto: use idle_timeout_seconds for HTTP.jl reads
+    idle_timeout_seconds = 120,   # stream inactivity timeout before reconnecting
     reconnect = true,
     max_reconnects = 0,          # unlimited reconnect attempts
+    reconnect_initial_delay_seconds = 60.0,
+    reconnect_max_delay_seconds = 320.0,
+    field_profile = :lean,       # :full keeps the existing rich hydration
+    write_includes = false,      # omit expansions/includes when author/media hydration is unnecessary
     rotate_jsonl_bytes = 1_000_000_000,
     state_flush_interval_seconds = 30.0,
 )
@@ -92,6 +99,10 @@ the stream.
 Stream state is written to `task_name.stream.state.json`. Disconnect windows are
 recorded in `task_name.stream.gaps.jsonl` so they can be reviewed or backfilled
 later with REST search.
+
+Use `list_stream_connections(cfg)` to inspect active/historical X streaming
+connections for the authenticated app. This is useful when the API reports a
+connection limit or when you suspect another process is still connected.
 
 ## Output conversion
 

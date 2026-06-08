@@ -7,8 +7,7 @@ function _open_stream_connection!(
     headers,
     params::Dict{String,String},
     started_at::Float64,
-    pending_gap_start::Base.RefValue{Union{Nothing,String}},
-    pending_gap_reason::Base.RefValue{String},
+    pending_gap::Base.RefValue{StreamGapSnapshot},
     state_flush_ref::Base.RefValue{Float64},
     activity_this_connection::Base.RefValue{Bool};
     open_http = HTTP.open,
@@ -21,36 +20,33 @@ function _open_stream_connection!(
         headers;
         query = params,
         status_exception = false,
-        readtimeout = cfg.idle_timeout_seconds,
+        readtimeout = _stream_readtimeout_seconds(cfg),
         decompress = false,
     ) do http
         resp = HTTP.startread(http)
         if resp.status != 200
-            body =
-                resp.status == 429 || 500 <= resp.status < 600 ? "" :
-                _stream_response_body(resp, http)
+            body = _stream_response_body(resp, http)
             status_outcome = _stream_response_outcome(resp, url; body = body)
-            if status_outcome.stop_reason == "rate_limited"
-                @warn "Stream rate limited" sleep_seconds =
-                    status_outcome.sleep_seconds
+            _record_stream_outcome_diagnostics!(st, status_outcome)
+            if status_outcome.stop_reason in ("rate_limited", "usage_capped")
+                @warn "Stream rate limited" reason = status_outcome.stop_reason sleep_seconds =
+                    status_outcome.sleep_seconds retry_after = status_outcome.retry_after rate_limit_reset =
+                    status_outcome.rate_limit_reset
             elseif status_outcome.stop_reason == "server_error"
-                @warn "Stream server error" status = resp.status
+                @warn "Stream server error" status = resp.status detail =
+                    status_outcome.error_detail
             end
             outcome_ref[] = status_outcome
             return nothing
         end
 
         connected_at = stream_now_utc()
+        _finish_stream_gap!(cfg, st, pending_gap, connected_at)
         st.last_connected_at = connected_at
         st.last_status = 200
         st.last_error = ""
-        _finish_stream_gap!(
-            cfg,
-            st,
-            pending_gap_start,
-            pending_gap_reason,
-            connected_at,
-        )
+        st.last_error_type = ""
+        st.last_error_detail = ""
         _maybe_persist_stream_state!(
             cfg,
             st,
@@ -118,8 +114,7 @@ function run_stream_collector(
     started_at = time()
     reconnects = 0
     delay = cfg.reconnect_initial_delay_seconds
-    pending_gap_start = Ref{Union{Nothing,String}}(nothing)
-    pending_gap_reason = Ref("")
+    pending_gap = Ref(StreamGapSnapshot())
     writer = Ref{Union{Nothing,StreamJsonlWriter}}(nothing)
 
     try
@@ -132,8 +127,7 @@ function run_stream_collector(
                 _finish_stream_gap!(
                     cfg,
                     st,
-                    pending_gap_start,
-                    pending_gap_reason,
+                    pending_gap,
                     stream_now_utc(),
                     stop_reason,
                 )
@@ -159,8 +153,7 @@ function run_stream_collector(
                     stream_headers,
                     params,
                     started_at,
-                    pending_gap_start,
-                    pending_gap_reason,
+                    pending_gap,
                     state_flush_ref,
                     activity_this_connection;
                     open_http = open_http,
@@ -179,13 +172,11 @@ function run_stream_collector(
 
                 if !isempty(outcome.stop_reason)
                     st.stop_reason = outcome.stop_reason
-                    outcome.status > 0 && (st.last_status = outcome.status)
-                    st.last_error = outcome.error
+                    _record_stream_outcome_diagnostics!(st, outcome)
                     if outcome.kind in (:retryable, :disconnected)
                         _begin_stream_gap!(
                             st,
-                            pending_gap_start,
-                            pending_gap_reason,
+                            pending_gap,
                             outcome.stop_reason,
                         )
                     end
@@ -203,8 +194,7 @@ function run_stream_collector(
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         st.stop_reason,
                     )
@@ -226,8 +216,7 @@ function run_stream_collector(
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         "interrupted",
                     )
@@ -239,11 +228,12 @@ function run_stream_collector(
                     st.stop_reason = "api_error"
                     st.last_status = api_error.status
                     st.last_error = _safe_showerror_text(api_error)
+                    st.last_error_type = "api_error"
+                    st.last_error_detail = api_error.body
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         "api_error",
                     )
@@ -258,8 +248,7 @@ function run_stream_collector(
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         stop_reason,
                     )
@@ -268,7 +257,7 @@ function run_stream_collector(
                     break
                 end
 
-                if activity_this_connection[]
+                if activity_this_connection[] && !_looks_like_stream_timeout(e)
                     reconnects = 0
                     delay = cfg.reconnect_initial_delay_seconds
                     st.consecutive_failures = 0
@@ -279,10 +268,15 @@ function run_stream_collector(
                 st.stop_reason = reason
                 st.last_status = 0
                 st.last_error = error_text
+                st.last_error_type = reason
+                st.last_error_detail = error_text
+                st.last_rate_limit_limit = 0
+                st.last_rate_limit_remaining = 0
+                st.last_rate_limit_reset = 0
+                st.last_retry_after = 0
                 _begin_stream_gap!(
                     st,
-                    pending_gap_start,
-                    pending_gap_reason,
+                    pending_gap,
                     reason,
                 )
 
@@ -292,8 +286,7 @@ function run_stream_collector(
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         "idle_timeout",
                     )
@@ -313,8 +306,7 @@ function run_stream_collector(
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         st.stop_reason,
                     )
@@ -334,8 +326,7 @@ function run_stream_collector(
             _finish_stream_gap!(
                 cfg,
                 st,
-                pending_gap_start,
-                pending_gap_reason,
+                pending_gap,
                 stream_now_utc(),
                 "disconnected",
             )

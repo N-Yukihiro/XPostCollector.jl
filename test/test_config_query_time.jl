@@ -33,6 +33,15 @@ end
 end
 
 @testset "StreamConfig validation and params" begin
+    default_cfg = StreamConfig(
+        task_name = "stream_defaults",
+        keywords_or = ["foo"],
+        api_base_url = "http://127.0.0.1:8080/",
+    )
+    validate!(default_cfg)
+    @test default_cfg.idle_timeout_seconds == 120
+    @test default_cfg.http_readtimeout_seconds == 0
+
     cfg = StreamConfig(
         task_name = "stream",
         keywords_or = ["foo"],
@@ -41,6 +50,7 @@ end
         max_posts = -1,
         max_seconds = -1,
         idle_timeout_seconds = 0,
+        http_readtimeout_seconds = -1,
         rotate_jsonl_bytes = -1,
         rotate_jsonl_seconds = -1,
         state_flush_interval_seconds = -1,
@@ -51,7 +61,10 @@ end
     @test cfg.max_posts == 0
     @test cfg.max_seconds == 0.0
     @test cfg.idle_timeout_seconds == 1
+    @test cfg.http_readtimeout_seconds == 0
     @test cfg.max_reconnects == 0
+    @test cfg.reconnect_initial_delay_seconds == 60.0
+    @test cfg.reconnect_max_delay_seconds == 320.0
     @test cfg.rotate_jsonl_bytes == 0
     @test cfg.rotate_jsonl_seconds == 0.0
     @test cfg.state_flush_interval_seconds == 0.0
@@ -61,6 +74,28 @@ end
     @test haskey(params, "expansions")
     @test occursin("created_at", params["tweet.fields"])
     @test endswith(out_stream_state(cfg), "stream.stream.state.json")
+
+    cfg.field_profile = :lean
+    cfg.write_includes = true
+    params = build_stream_params(cfg)
+    @test params["expansions"] == "author_id"
+    @test haskey(params, "user.fields")
+    @test !haskey(params, "media.fields")
+    @test occursin("public_metrics", params["tweet.fields"])
+
+    cfg.write_includes = false
+    params = build_stream_params(cfg)
+    @test !haskey(params, "expansions")
+    @test !haskey(params, "user.fields")
+
+    cfg.field_profile = :minimal
+    cfg.write_includes = true
+    params = build_stream_params(cfg)
+    @test haskey(params, "tweet.fields")
+    @test !haskey(params, "expansions")
+
+    cfg.field_profile = :invalid
+    @test_throws ErrorException validate!(cfg)
 
     scfg = SearchConfig(
         task_name = "search",

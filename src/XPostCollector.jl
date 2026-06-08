@@ -8,6 +8,7 @@ export SearchConfig,
     run_collector,
     run_stream_collector,
     list_stream_rules,
+    list_stream_connections,
     ensure_stream_rule!,
     convert_outputs,
     convert_outputs_wide

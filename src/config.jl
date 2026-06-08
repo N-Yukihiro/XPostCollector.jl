@@ -69,14 +69,16 @@ Base.@kwdef mutable struct StreamConfig
 
     max_posts::Int = 0
     max_seconds::Float64 = 0.0
-    idle_timeout_seconds::Int = 30
+    idle_timeout_seconds::Int = 120
+    http_readtimeout_seconds::Int = 0
 
     reconnect::Bool = true
     max_reconnects::Int = 0
-    reconnect_initial_delay_seconds::Float64 = 5.0
-    reconnect_max_delay_seconds::Float64 = 60.0
+    reconnect_initial_delay_seconds::Float64 = 60.0
+    reconnect_max_delay_seconds::Float64 = 320.0
 
     write_includes::Bool = true
+    field_profile::Symbol = :full
     durable_writes::Bool = false
     rotate_jsonl_bytes::Int = 0
     rotate_jsonl_seconds::Float64 = 0.0
@@ -125,6 +127,7 @@ function as_search_config(cfg::StreamConfig)
         extra_query_tail = cfg.extra_query_tail,
         exclude_reposts = cfg.exclude_reposts,
         api_base_url = cfg.api_base_url,
+        write_includes = cfg.write_includes,
         out_dir = cfg.out_dir,
         log_dir = cfg.log_dir,
         db_path = cfg.db_path,
@@ -179,11 +182,14 @@ function validate!(cfg::StreamConfig)
     cfg.max_posts = max(cfg.max_posts, 0)
     cfg.max_seconds = max(cfg.max_seconds, 0.0)
     cfg.idle_timeout_seconds = max(cfg.idle_timeout_seconds, 1)
+    cfg.http_readtimeout_seconds = max(cfg.http_readtimeout_seconds, 0)
     cfg.max_reconnects = max(cfg.max_reconnects, 0)
     cfg.reconnect_initial_delay_seconds =
         max(cfg.reconnect_initial_delay_seconds, 0.1)
     cfg.reconnect_max_delay_seconds =
         max(cfg.reconnect_max_delay_seconds, cfg.reconnect_initial_delay_seconds)
+    cfg.field_profile in (:full, :lean, :minimal) ||
+        error("invalid stream field_profile: $(cfg.field_profile)")
     cfg.rotate_jsonl_bytes = max(cfg.rotate_jsonl_bytes, 0)
     cfg.rotate_jsonl_seconds = max(cfg.rotate_jsonl_seconds, 0.0)
     cfg.state_flush_interval_seconds = max(cfg.state_flush_interval_seconds, 0.0)

@@ -5,6 +5,24 @@ struct StreamOutcome
     activity::Bool
     status::Int
     error::String
+    error_type::String
+    error_detail::String
+    rate_limit_limit::Int
+    rate_limit_remaining::Int
+    rate_limit_reset::Int
+    retry_after::Int
+end
+
+Base.@kwdef mutable struct StreamGapSnapshot
+    start_time_utc::Union{Nothing,String} = nothing
+    reason::String = ""
+    status::Int = 0
+    error_type::String = ""
+    error_detail::String = ""
+    rate_limit_limit::Int = 0
+    rate_limit_remaining::Int = 0
+    rate_limit_reset::Int = 0
+    retry_after::Int = 0
 end
 
 const STREAM_EMPTY_READ_SLEEP_SECONDS = 0.01
@@ -16,6 +34,12 @@ function StreamOutcome(;
     activity::Bool = false,
     status::Integer = 0,
     error::AbstractString = "",
+    error_type::AbstractString = "",
+    error_detail::AbstractString = "",
+    rate_limit_limit::Integer = 0,
+    rate_limit_remaining::Integer = 0,
+    rate_limit_reset::Integer = 0,
+    retry_after::Integer = 0,
 )
     return StreamOutcome(
         kind,
@@ -24,6 +48,12 @@ function StreamOutcome(;
         activity,
         Int(status),
         String(error),
+        String(error_type),
+        String(error_detail),
+        Int(rate_limit_limit),
+        Int(rate_limit_remaining),
+        Int(rate_limit_reset),
+        Int(retry_after),
     )
 end
 
@@ -207,21 +237,35 @@ function _write_stream_gap!(
     reason::AbstractString,
 )
     isempty(start_time_utc) && return nothing
+    record = Dict{String,Any}(
+        "task_name" => st.task_name,
+        "query" => st.query,
+        "rule_id" => st.rule_id,
+        "rule_tag" => st.rule_tag,
+        "start_time_utc" => String(start_time_utc),
+        "end_time_utc" => String(end_time_utc),
+        "reason" => String(reason),
+        "recorded_at" => stream_now_utc(),
+    )
+    !isempty(st.last_error_type) && (record["error_type"] = st.last_error_type)
+    !isempty(st.last_error_detail) && (record["error_detail"] = st.last_error_detail)
+    st.last_status > 0 && (record["status"] = st.last_status)
+    has_rate_limit_diagnostics =
+        st.last_status == 429 ||
+        st.last_rate_limit_limit > 0 ||
+        st.last_rate_limit_reset > 0 ||
+        st.last_retry_after > 0
+    st.last_rate_limit_limit > 0 &&
+        (record["rate_limit_limit"] = st.last_rate_limit_limit)
+    has_rate_limit_diagnostics &&
+        (record["rate_limit_remaining"] = st.last_rate_limit_remaining)
+    st.last_rate_limit_reset > 0 &&
+        (record["rate_limit_reset"] = st.last_rate_limit_reset)
+    st.last_retry_after > 0 && (record["retry_after"] = st.last_retry_after)
+
     mkpath(cfg.out_dir)
     open(out_stream_gaps(cfg), "a") do io
-        JSON3.write(
-            io,
-            Dict(
-                "task_name" => st.task_name,
-                "query" => st.query,
-                "rule_id" => st.rule_id,
-                "rule_tag" => st.rule_tag,
-                "start_time_utc" => String(start_time_utc),
-                "end_time_utc" => String(end_time_utc),
-                "reason" => String(reason),
-                "recorded_at" => stream_now_utc(),
-            ),
-        )
+        JSON3.write(io, record)
         write(io, '\n')
         flush(io)
         cfg.durable_writes && _maybe_fsync(io)
@@ -229,32 +273,87 @@ function _write_stream_gap!(
     return nothing
 end
 
+function _write_stream_gap!(
+    cfg::StreamConfig,
+    st::StreamState,
+    gap::StreamGapSnapshot,
+    end_time_utc::AbstractString,
+    reason::AbstractString = gap.reason,
+)
+    gap.start_time_utc === nothing && return nothing
+    gap_reason = isempty(reason) ? "disconnected" : String(reason)
+    record = Dict{String,Any}(
+        "task_name" => st.task_name,
+        "query" => st.query,
+        "rule_id" => st.rule_id,
+        "rule_tag" => st.rule_tag,
+        "start_time_utc" => gap.start_time_utc::String,
+        "end_time_utc" => String(end_time_utc),
+        "reason" => gap_reason,
+        "recorded_at" => stream_now_utc(),
+    )
+    !isempty(gap.error_type) && (record["error_type"] = gap.error_type)
+    !isempty(gap.error_detail) && (record["error_detail"] = gap.error_detail)
+    gap.status > 0 && (record["status"] = gap.status)
+    has_rate_limit_diagnostics =
+        gap.status == 429 ||
+        gap.rate_limit_limit > 0 ||
+        gap.rate_limit_reset > 0 ||
+        gap.retry_after > 0
+    gap.rate_limit_limit > 0 && (record["rate_limit_limit"] = gap.rate_limit_limit)
+    has_rate_limit_diagnostics &&
+        (record["rate_limit_remaining"] = gap.rate_limit_remaining)
+    gap.rate_limit_reset > 0 && (record["rate_limit_reset"] = gap.rate_limit_reset)
+    gap.retry_after > 0 && (record["retry_after"] = gap.retry_after)
+
+    mkpath(cfg.out_dir)
+    open(out_stream_gaps(cfg), "a") do io
+        JSON3.write(io, record)
+        write(io, '\n')
+        flush(io)
+        cfg.durable_writes && _maybe_fsync(io)
+    end
+    return nothing
+end
+
+function _stream_gap_snapshot(st::StreamState, start_time_utc, reason::AbstractString)
+    return StreamGapSnapshot(
+        start_time_utc = start_time_utc,
+        reason = String(reason),
+        status = st.last_status,
+        error_type = st.last_error_type,
+        error_detail = st.last_error_detail,
+        rate_limit_limit = st.last_rate_limit_limit,
+        rate_limit_remaining = st.last_rate_limit_remaining,
+        rate_limit_reset = st.last_rate_limit_reset,
+        retry_after = st.last_retry_after,
+    )
+end
+
 function _begin_stream_gap!(
     st::StreamState,
-    pending_gap_start::Base.RefValue{Union{Nothing,String}},
-    pending_gap_reason::Base.RefValue{String},
+    pending_gap::Base.RefValue{StreamGapSnapshot},
     reason::AbstractString,
 )
     disconnected_at = stream_now_utc()
     st.last_disconnect_at = disconnected_at
-    pending_gap_start[] === nothing && (pending_gap_start[] = disconnected_at)
-    isempty(pending_gap_reason[]) && (pending_gap_reason[] = String(reason))
+    pending_gap[].start_time_utc === nothing &&
+        (pending_gap[] = _stream_gap_snapshot(st, disconnected_at, reason))
     return disconnected_at
 end
 
 function _finish_stream_gap!(
     cfg::StreamConfig,
     st::StreamState,
-    pending_gap_start::Base.RefValue{Union{Nothing,String}},
-    pending_gap_reason::Base.RefValue{String},
+    pending_gap::Base.RefValue{StreamGapSnapshot},
     end_time_utc::AbstractString,
-    reason::AbstractString = pending_gap_reason[],
+    reason::AbstractString = pending_gap[].reason,
 )
-    pending_gap_start[] === nothing && return nothing
-    gap_reason = isempty(reason) ? "disconnected" : String(reason)
-    _write_stream_gap!(cfg, st, pending_gap_start[]::String, end_time_utc, gap_reason)
-    pending_gap_start[] = nothing
-    pending_gap_reason[] = ""
+    pending_gap[].start_time_utc === nothing && return nothing
+    gap_reason = isempty(reason) ? pending_gap[].reason : String(reason)
+    gap_reason = isempty(gap_reason) ? "disconnected" : gap_reason
+    _write_stream_gap!(cfg, st, pending_gap[], end_time_utc, gap_reason)
+    pending_gap[] = StreamGapSnapshot()
     return nothing
 end
 
@@ -277,6 +376,48 @@ function _throw_stream_response_error(resp, url::AbstractString, body::AbstractS
     throw(XApiAccessError(resp.status, String(url), body_text))
 end
 
+function _response_header_int(resp, name::AbstractString)::Int
+    try
+        v = HTTP.header(resp, String(name))
+        isempty(v) && return 0
+        return parse(Int, v)
+    catch
+        return 0
+    end
+end
+
+function _stream_error_metadata(body::AbstractString)
+    txt = strip(String(body))
+    isempty(txt) && return (type = "", title = "", detail = "")
+    try
+        obj = JSON3.read(txt)
+        title = safe_str(_json_get(obj, "title", nothing); default = "")
+        detail = safe_str(_json_get(obj, "detail", nothing); default = "")
+        typ = safe_str(_json_get(obj, "type", nothing); default = "")
+        if isempty(title) && isempty(detail) && isempty(typ) && _json_haskey(obj, "errors")
+            for err in _json_items(_json_get(obj, "errors", nothing))
+                title = safe_str(_json_get(err, "title", nothing); default = "")
+                detail = safe_str(_json_get(err, "detail", nothing); default = "")
+                typ = safe_str(_json_get(err, "type", nothing); default = "")
+                break
+            end
+        end
+        return (type = typ, title = title, detail = detail)
+    catch
+        return (type = "", title = "", detail = txt)
+    end
+end
+
+function _stream_429_stop_reason(meta)::String
+    text = _ascii_lowercase_text(join((meta.type, meta.title, meta.detail), " "))
+    if occursin("usage-capped", text) ||
+       occursin("usage capped", text) ||
+       occursin("usage cap", text)
+        return "usage_capped"
+    end
+    return "rate_limited"
+end
+
 function _stream_response_outcome(resp, url::AbstractString; body::AbstractString = "")
     resp.status == 200 &&
         return StreamOutcome(
@@ -287,14 +428,26 @@ function _stream_response_outcome(resp, url::AbstractString; body::AbstractStrin
             status = 200,
             error = "",
         )
+    meta = _stream_error_metadata(body)
+    rate_limit_limit = _response_header_int(resp, "x-rate-limit-limit")
+    rate_limit_remaining = _response_header_int(resp, "x-rate-limit-remaining")
+    rate_limit_reset = _response_header_int(resp, "x-rate-limit-reset")
+    retry_after = _response_header_int(resp, "retry-after")
     if resp.status == 429
+        stop_reason = _stream_429_stop_reason(meta)
         return StreamOutcome(
             kind = :retryable,
-            stop_reason = "rate_limited",
-            sleep_seconds = rate_limit_sleep_seconds(resp),
+            stop_reason = stop_reason,
+            sleep_seconds = rate_limit_sleep_seconds(resp; min_backoff_seconds = 60),
             activity = false,
             status = resp.status,
-            error = "rate limited",
+            error = stop_reason == "usage_capped" ? "usage cap exceeded" : "rate limited",
+            error_type = meta.type,
+            error_detail = meta.detail,
+            rate_limit_limit = rate_limit_limit,
+            rate_limit_remaining = rate_limit_remaining,
+            rate_limit_reset = rate_limit_reset,
+            retry_after = retry_after,
         )
     elseif 500 <= resp.status < 600
         return StreamOutcome(
@@ -304,10 +457,32 @@ function _stream_response_outcome(resp, url::AbstractString; body::AbstractStrin
             activity = false,
             status = resp.status,
             error = "server error",
+            error_type = meta.type,
+            error_detail = meta.detail,
+            rate_limit_limit = rate_limit_limit,
+            rate_limit_remaining = rate_limit_remaining,
+            rate_limit_reset = rate_limit_reset,
+            retry_after = retry_after,
         )
     end
     _throw_stream_response_error(resp, url, body)
 end
+
+function _record_stream_outcome_diagnostics!(st::StreamState, outcome::StreamOutcome)
+    outcome.status > 0 && (st.last_status = outcome.status)
+    st.last_error = outcome.error
+    st.last_error_type = outcome.error_type
+    st.last_error_detail = outcome.error_detail
+    st.last_rate_limit_limit = outcome.rate_limit_limit
+    st.last_rate_limit_remaining = outcome.rate_limit_remaining
+    st.last_rate_limit_reset = outcome.rate_limit_reset
+    st.last_retry_after = outcome.retry_after
+    return st
+end
+
+_stream_readtimeout_seconds(cfg::StreamConfig)::Int =
+    cfg.http_readtimeout_seconds > 0 ? cfg.http_readtimeout_seconds :
+    cfg.idle_timeout_seconds
 
 function _record_stream_line!(
     cfg::StreamConfig,
