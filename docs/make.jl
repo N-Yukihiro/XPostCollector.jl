@@ -4,20 +4,20 @@ using Documenter
 DocMeta.setdocmeta!(XPostCollector, :DocTestSetup, :(using XPostCollector); recursive=true)
 
 function default_branch_name()
-    env_branch = strip(get(ENV, "GITHUB_DEFAULT_BRANCH", ""))
+    env_branch = String(strip(get(ENV, "GITHUB_DEFAULT_BRANCH", "")))
     !isempty(env_branch) && return env_branch
 
     ref = try
-        strip(read(`git symbolic-ref --short refs/remotes/origin/HEAD`, String))
+        String(strip(read(`git symbolic-ref --short refs/remotes/origin/HEAD`, String)))
     catch
         ""
     end
     prefix = "origin/"
-    branch = startswith(ref, prefix) ? ref[(lastindex(prefix)+1):end] : ref
+    branch = startswith(ref, prefix) ? String(ref[(lastindex(prefix)+1):end]) : ref
     !isempty(branch) && return branch
 
     return try
-        strip(read(`git branch --show-current`, String))
+        String(strip(read(`git branch --show-current`, String)))
     catch
         ""
     end
