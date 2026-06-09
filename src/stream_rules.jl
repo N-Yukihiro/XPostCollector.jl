@@ -344,18 +344,13 @@ function ensure_stream_rule!(cfg::StreamConfig, headers, fetch_json::Function)
         end
     end
 
-    if !isempty(same_tag)
+    replacing_tag = !isempty(same_tag)
+    delete_ids = String[]
+    if replacing_tag
         if !cfg.replace_rule_by_tag
             error("Stream rule tag '$tag' already exists with a different value")
         end
         delete_ids = _stream_rule_delete_ids_or_error(same_tag, tag)
-        delete_res = delete_stream_rules!(
-            cfg,
-            headers,
-            delete_ids,
-            fetch_json,
-        )
-        _assert_stream_rules_response_ok(delete_res; action = :delete)
     end
 
     res = add_stream_rule!(cfg, headers, value, tag, fetch_json)
@@ -366,5 +361,21 @@ function ensure_stream_rule!(cfg::StreamConfig, headers, fetch_json::Function)
     isempty(created_rule.id) &&
         error("Stream rules API add succeeded but the created rule id was not returned")
     rid = created_rule.id
+    if replacing_tag
+        try
+            delete_res = delete_stream_rules!(
+                cfg,
+                headers,
+                delete_ids,
+                fetch_json,
+            )
+            _assert_stream_rules_response_ok(delete_res; action = :delete)
+        catch e
+            old_ids = join(delete_ids, ",")
+            error(
+                "Stream rule tag '$tag' replacement created new rule id '$rid' but failed to delete old rule ids [$old_ids]: $(sprint(showerror, e))",
+            )
+        end
+    end
     return (id = rid, value = value, tag = tag, created = true, response = res)
 end

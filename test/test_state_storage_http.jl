@@ -35,17 +35,42 @@ end
         st.total_tweets = 123
         st.total_includes = 9
         st.completed = false
+        st.stop_reason = "target_posts"
         st.converted_jsonl_offset = 456
         st.converted_at = "c"
 
         save_state(p, st)
+        raw = JSON3.read(read(p, String))
+        @test raw["stop_reason"] == "target_posts"
         st2 = load_state(p)
         @test st2 !== nothing
         @test st2.task_name == "task"
         @test st2.page_count == 7
         @test st2.total_tweets == 123
+        @test st2.stop_reason == "target_posts"
         @test st2.converted_jsonl_offset == 456
         @test st2.start_time_utc == "2026-01-01T00:00:00Z"
+
+        legacy = Dict(
+            "timestamp" => "t",
+            "task_name" => "legacy",
+            "query" => "q",
+            "start_time_utc" => nothing,
+            "end_time_utc" => nothing,
+            "next_token" => nothing,
+            "page_count" => 1,
+            "total_tweets" => 2,
+            "total_includes" => 3,
+            "completed" => true,
+            "converted_jsonl_offset" => 4,
+            "converted_at" => "c",
+        )
+        legacy_path = joinpath(dir, "legacy.state.json")
+        write(legacy_path, String(JSON3.write(legacy)))
+        legacy_loaded = load_state(legacy_path)
+        @test legacy_loaded !== nothing
+        @test legacy_loaded.task_name == "legacy"
+        @test legacy_loaded.stop_reason == ""
     end
 end
 

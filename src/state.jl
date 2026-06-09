@@ -12,12 +12,13 @@ mutable struct CollectorState
     total_tweets::Int
     total_includes::Int
     completed::Bool
+    stop_reason::String
     converted_jsonl_offset::Int
     converted_at::String
 end
 
 CollectorState() =
-    CollectorState("", "", "", nothing, nothing, nothing, 0, 0, 0, false, 0, "")
+    CollectorState("", "", "", nothing, nothing, nothing, 0, 0, 0, false, "", 0, "")
 StructTypes.StructType(::Type{CollectorState}) = StructTypes.Mutable()
 
 Base.@kwdef mutable struct StreamDiagnostics
@@ -112,15 +113,58 @@ end
 function load_stream_state(path::AbstractString)::Union{Nothing,StreamState}
     !isfile(path) && return nothing
     try
-        txt = read(path, String)
-        st = StreamState()
-        JSON3.read!(txt, st)
-        _migrate_stream_state_diagnostics!(st, JSON3.read(txt))
-        return st
+        return _stream_state_from_json(JSON3.read(read(path, String)))
     catch e
         @warn "Stream state file unreadable; start fresh" path = path exception = e
         return nothing
     end
+end
+
+function _stream_state_from_json(obj)::StreamState
+    st = StreamState()
+    st.timestamp = safe_str(_json_get(obj, "timestamp", st.timestamp); default = st.timestamp)
+    st.task_name = safe_str(_json_get(obj, "task_name", st.task_name); default = st.task_name)
+    st.query = safe_str(_json_get(obj, "query", st.query); default = st.query)
+    rule_id = _json_get(obj, "rule_id", st.rule_id)
+    st.rule_id = isnull(rule_id) ? nothing : safe_str(rule_id; default = "")
+    st.rule_tag = safe_str(_json_get(obj, "rule_tag", st.rule_tag); default = st.rule_tag)
+    st.connection_count =
+        safe_int(_json_get(obj, "connection_count", st.connection_count); default = st.connection_count)
+    st.total_tweets =
+        safe_int(_json_get(obj, "total_tweets", st.total_tweets); default = st.total_tweets)
+    st.total_includes =
+        safe_int(_json_get(obj, "total_includes", st.total_includes); default = st.total_includes)
+    st.keepalive_count =
+        safe_int(_json_get(obj, "keepalive_count", st.keepalive_count); default = st.keepalive_count)
+    st.last_heartbeat_at = safe_str(
+        _json_get(obj, "last_heartbeat_at", st.last_heartbeat_at);
+        default = st.last_heartbeat_at,
+    )
+    st.last_event_at =
+        safe_str(_json_get(obj, "last_event_at", st.last_event_at); default = st.last_event_at)
+    st.consecutive_failures = safe_int(
+        _json_get(obj, "consecutive_failures", st.consecutive_failures);
+        default = st.consecutive_failures,
+    )
+    st.last_connected_at = safe_str(
+        _json_get(obj, "last_connected_at", st.last_connected_at);
+        default = st.last_connected_at,
+    )
+    st.last_disconnect_at = safe_str(
+        _json_get(obj, "last_disconnect_at", st.last_disconnect_at);
+        default = st.last_disconnect_at,
+    )
+    st.seen_count =
+        safe_int(_json_get(obj, "seen_count", st.seen_count); default = st.seen_count)
+    st.db_path = safe_str(_json_get(obj, "db_path", st.db_path); default = st.db_path)
+    st.db_size_bytes =
+        safe_int(_json_get(obj, "db_size_bytes", st.db_size_bytes); default = st.db_size_bytes)
+    st.completed =
+        safe_bool(_json_get(obj, "completed", st.completed); default = st.completed)
+    st.stop_reason =
+        safe_str(_json_get(obj, "stop_reason", st.stop_reason); default = st.stop_reason)
+    _migrate_stream_state_diagnostics!(st, obj)
+    return st
 end
 
 function _migrate_stream_state_diagnostics!(st::StreamState, obj)

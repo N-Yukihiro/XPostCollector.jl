@@ -37,6 +37,7 @@
 
                 urls = String[]
                 calls = Ref(0)
+                sleep_calls = Ref(0)
 
                 request_stub =
                     (
@@ -103,7 +104,7 @@
                 client = XApiClient(
                     bearer_token = "dummy",
                     request_fn = request_stub,
-                    sleep_fn = _ -> nothing,
+                    sleep_fn = _ -> (sleep_calls[] += 1),
                     rand_fn = () -> 0.0,
                 )
 
@@ -114,6 +115,22 @@
                 @test occursin("/2/tweets/search/all", urls[2])
 
                 @test st.total_tweets >= 3
+                @test st.completed == false
+                @test st.next_token == "N2"
+                @test st.stop_reason == "target_posts"
+                @test sleep_calls[] == 1
+
+                st_again = run_collector(cfg; client = client)
+                @test calls[] == 2
+                @test st_again.completed == false
+                @test st_again.stop_reason == "target_posts"
+
+                cfg.target_posts = 5
+                st_resumed = run_collector(cfg; client = client)
+                @test calls[] == 3
+                @test st_resumed.completed == true
+                @test st_resumed.next_token === nothing
+                @test st_resumed.stop_reason == "completed"
 
                 # JSONL に page マーカーが入っている
                 jlines = readlines(out_jsonl(cfg))

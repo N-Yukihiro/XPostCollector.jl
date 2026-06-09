@@ -95,8 +95,8 @@ end
             @test result.created == true
             @test result.id == "new-rule"
             @test methods == ["GET", "POST", "POST"]
-            @test bodies[2]["delete"]["ids"] == ["old-rule"]
-            @test haskey(bodies[3], "add")
+            @test haskey(bodies[2], "add")
+            @test bodies[3]["delete"]["ids"] == ["old-rule"]
         end
     end
 end
@@ -162,6 +162,29 @@ end
             )
 
             cfg.replace_rule_by_tag = true
+            replace_add_failure_bodies = Any[]
+            replace_add_failure_stub =
+                (method, url, headers, params; body = nothing, max_retries = 6, readtimeout = 30) -> begin
+                    if method == "GET"
+                        return Dict(
+                            "data" => Any[
+                                Dict("id" => "old-rule", "value" => "other", "tag" => cfg.rule_tag),
+                            ],
+                        )
+                    end
+                    push!(replace_add_failure_bodies, body)
+                    haskey(body, "delete") && error("delete should not run when replacement add fails")
+                    return Dict("errors" => Any[Dict("detail" => "bad replacement")])
+                end
+            @test_throws ErrorException ensure_stream_rule!(
+                cfg,
+                headers,
+                replace_add_failure_stub,
+            )
+            @test length(replace_add_failure_bodies) == 1
+            @test haskey(replace_add_failure_bodies[1], "add")
+
+            delete_failure_bodies = Any[]
             delete_failure_stub =
                 (method, url, headers, params; body = nothing, max_retries = 6, readtimeout = 30) -> begin
                     if method == "GET"
@@ -171,12 +194,20 @@ end
                             ],
                         )
                     end
+                    push!(delete_failure_bodies, body)
                     if haskey(body, "delete")
                         return Dict("meta" => Dict("summary" => Dict("not_deleted" => 1)))
                     end
-                    return Dict("data" => Any[])
+                    add = body["add"][1]
+                    return Dict(
+                        "data" => Any[
+                            Dict("id" => "new-rule", "value" => add["value"], "tag" => add["tag"]),
+                        ],
+                    )
             end
             @test_throws ErrorException ensure_stream_rule!(cfg, headers, delete_failure_stub)
+            @test haskey(delete_failure_bodies[1], "add")
+            @test delete_failure_bodies[2]["delete"]["ids"] == ["old-rule"]
 
             methods = String[]
             missing_id_stub =

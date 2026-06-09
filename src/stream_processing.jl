@@ -238,6 +238,25 @@ function _maybe_persist_stream_state!(
     return nothing
 end
 
+function _add_stream_diagnostics_fields!(record::Dict{String,Any}, diag::StreamDiagnostics)
+    !isempty(diag.error_type) && (record["error_type"] = diag.error_type)
+    !isempty(diag.error_detail) && (record["error_detail"] = diag.error_detail)
+    diag.status > 0 && (record["status"] = diag.status)
+    has_rate_limit_diagnostics =
+        diag.status == 429 ||
+        diag.rate_limit_limit > 0 ||
+        diag.rate_limit_reset > 0 ||
+        diag.retry_after > 0
+    diag.rate_limit_limit > 0 &&
+        (record["rate_limit_limit"] = diag.rate_limit_limit)
+    has_rate_limit_diagnostics &&
+        (record["rate_limit_remaining"] = diag.rate_limit_remaining)
+    diag.rate_limit_reset > 0 &&
+        (record["rate_limit_reset"] = diag.rate_limit_reset)
+    diag.retry_after > 0 && (record["retry_after"] = diag.retry_after)
+    return record
+end
+
 function _write_stream_gap!(
     cfg::StreamConfig,
     st::StreamState,
@@ -256,22 +275,7 @@ function _write_stream_gap!(
         "reason" => String(reason),
         "recorded_at" => stream_now_utc(),
     )
-    diag = st.diagnostics
-    !isempty(diag.error_type) && (record["error_type"] = diag.error_type)
-    !isempty(diag.error_detail) && (record["error_detail"] = diag.error_detail)
-    diag.status > 0 && (record["status"] = diag.status)
-    has_rate_limit_diagnostics =
-        diag.status == 429 ||
-        diag.rate_limit_limit > 0 ||
-        diag.rate_limit_reset > 0 ||
-        diag.retry_after > 0
-    diag.rate_limit_limit > 0 &&
-        (record["rate_limit_limit"] = diag.rate_limit_limit)
-    has_rate_limit_diagnostics &&
-        (record["rate_limit_remaining"] = diag.rate_limit_remaining)
-    diag.rate_limit_reset > 0 &&
-        (record["rate_limit_reset"] = diag.rate_limit_reset)
-    diag.retry_after > 0 && (record["retry_after"] = diag.retry_after)
+    _add_stream_diagnostics_fields!(record, st.diagnostics)
 
     mkpath(cfg.out_dir)
     open(out_stream_gaps(cfg), "a") do io
@@ -302,20 +306,7 @@ function _write_stream_gap!(
         "reason" => gap_reason,
         "recorded_at" => stream_now_utc(),
     )
-    diag = gap.diagnostics
-    !isempty(diag.error_type) && (record["error_type"] = diag.error_type)
-    !isempty(diag.error_detail) && (record["error_detail"] = diag.error_detail)
-    diag.status > 0 && (record["status"] = diag.status)
-    has_rate_limit_diagnostics =
-        diag.status == 429 ||
-        diag.rate_limit_limit > 0 ||
-        diag.rate_limit_reset > 0 ||
-        diag.retry_after > 0
-    diag.rate_limit_limit > 0 && (record["rate_limit_limit"] = diag.rate_limit_limit)
-    has_rate_limit_diagnostics &&
-        (record["rate_limit_remaining"] = diag.rate_limit_remaining)
-    diag.rate_limit_reset > 0 && (record["rate_limit_reset"] = diag.rate_limit_reset)
-    diag.retry_after > 0 && (record["retry_after"] = diag.retry_after)
+    _add_stream_diagnostics_fields!(record, gap.diagnostics)
 
     mkpath(cfg.out_dir)
     open(out_stream_gaps(cfg), "a") do io

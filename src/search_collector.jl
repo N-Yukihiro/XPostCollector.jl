@@ -55,6 +55,14 @@ function run_collector(cfg::SearchConfig; client::XApiClient = XApiClient())
             @info "Already completed for same window; skip" task = cfg.task_name
             return st
         end
+        if same_window &&
+           st.stop_reason == "target_posts" &&
+           cfg.target_posts > 0 &&
+           st.total_tweets >= cfg.target_posts
+            @info "Already stopped at target_posts for same window; skip" task =
+                cfg.task_name target_posts = cfg.target_posts total = st.total_tweets
+            return st
+        end
 
         if same_window && !st.completed && st.next_token !== nothing
             resume_next = st.next_token
@@ -85,6 +93,7 @@ function run_collector(cfg::SearchConfig; client::XApiClient = XApiClient())
     st2.end_time_utc = end_utc
     st2.next_token = resume_next
     st2.completed = false
+    st2.stop_reason = ""
 
     sdb = init_seen_db(cfg)
     last_all_req_time = Ref{Float64}(0.0)
@@ -98,7 +107,7 @@ function run_collector(cfg::SearchConfig; client::XApiClient = XApiClient())
         if last > 0
             dt = t - last
             if dt < cfg.all_min_interval_seconds
-                sleep(cfg.all_min_interval_seconds - dt)
+                client.sleep_fn(cfg.all_min_interval_seconds - dt)
             end
         end
         last_all_req_time[] = time()
@@ -132,6 +141,7 @@ function run_collector(cfg::SearchConfig; client::XApiClient = XApiClient())
                         stop_reason = :invalid_pagination_token
                         st2.next_token = nothing
                         st2.completed = true
+                        st2.stop_reason = "invalid_pagination_token"
                         persist_state!()
                         break
                     elseif e isa FullArchiveAccessError
@@ -199,6 +209,7 @@ function run_collector(cfg::SearchConfig; client::XApiClient = XApiClient())
 
                 st2.next_token = next_token
                 st2.completed = (next_token === nothing)
+                st2.completed && (st2.stop_reason = "completed")
                 persist_state!()
 
                 @info "Page done" page = st2.page_count new_tweets = page_new total =
@@ -216,6 +227,7 @@ function run_collector(cfg::SearchConfig; client::XApiClient = XApiClient())
                                 usage.project_usage project_cap = usage.project_cap
                             st2.next_token = nothing
                             st2.completed = true
+                            st2.stop_reason = "usage_cap_reached"
                             persist_state!()
                             break
                         end
@@ -228,6 +240,8 @@ function run_collector(cfg::SearchConfig; client::XApiClient = XApiClient())
                     stop_reason = :target_posts
                     @info "Stop by target_posts (page boundary)" target_posts =
                         cfg.target_posts total = st2.total_tweets
+                    st2.stop_reason = "target_posts"
+                    persist_state!()
                     break
                 end
 

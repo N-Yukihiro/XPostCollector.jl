@@ -2,8 +2,8 @@
 
 [![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://N-Yukihiro.github.io/XPostCollector.jl/stable/)
 [![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://N-Yukihiro.github.io/XPostCollector.jl/dev/)
-[![Build Status](https://github.com/N-Yukihiro/XPostCollector.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/N-Yukihiro/XPostCollector.jl/actions/workflows/CI.yml?query=branch%3Amaster)
-[![Coverage](https://codecov.io/gh/N-Yukihiro/XPostCollector.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/N-Yukihiro/XPostCollector.jl)
+[![Build Status](https://github.com/N-Yukihiro/XPostCollector.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/N-Yukihiro/XPostCollector.jl/actions/workflows/CI.yml)
+[![Coverage](https://codecov.io/gh/N-Yukihiro/XPostCollector.jl/graph/badge.svg)](https://codecov.io/gh/N-Yukihiro/XPostCollector.jl)
 
 XPostCollector.jl collects posts from the X API v2 search endpoints and filtered
 stream endpoint. It stores raw JSONL safely, keeps state for resumable runs,
@@ -104,6 +104,11 @@ run_stream_collector(cfg)
 `list_stream_rules(cfg)` to inspect current rules and `ensure_stream_rule!(cfg)`
 when you want to create or update the configured rule explicitly before opening
 the stream.
+
+When `replace_rule_by_tag = true`, rule replacement creates the new rule before
+deleting old rules with the same tag to avoid stream coverage gaps. If deletion
+fails after creation, inspect `list_stream_rules(cfg)` and clean up the old rule
+IDs reported in the error.
 
 Stream state is written to `task_name.stream.state.json`. Disconnect windows are
 recorded in `task_name.stream.gaps.jsonl` so they can be reviewed or backfilled
