@@ -1,4 +1,5 @@
 function _open_stream_connection!(
+    client::XApiClient,
     cfg::StreamConfig,
     st::StreamState,
     sdb::SeenDB,
@@ -7,50 +8,43 @@ function _open_stream_connection!(
     headers,
     params::Dict{String,String},
     started_at::Float64,
-    pending_gap_start::Base.RefValue{Union{Nothing,String}},
-    pending_gap_reason::Base.RefValue{String},
+    pending_gap::Base.RefValue{StreamGapSnapshot},
     state_flush_ref::Base.RefValue{Float64},
-    activity_this_connection::Base.RefValue{Bool};
-    open_http = HTTP.open,
-    sleep_fn::Function = sleep,
+    activity_this_connection::Base.RefValue{Bool},
 )::StreamOutcome
     outcome_ref = Ref{Union{Nothing,StreamOutcome}}(nothing)
-    open_http(
+    client.open_fn(
         :GET,
         url,
         headers;
         query = params,
         status_exception = false,
-        readtimeout = cfg.idle_timeout_seconds,
+        readtimeout = _stream_readtimeout_seconds(cfg),
         decompress = false,
     ) do http
         resp = HTTP.startread(http)
         if resp.status != 200
-            body =
-                resp.status == 429 || 500 <= resp.status < 600 ? "" :
-                _stream_response_body(resp, http)
+            body = _stream_response_body(resp, http)
             status_outcome = _stream_response_outcome(resp, url; body = body)
-            if status_outcome.stop_reason == "rate_limited"
-                @warn "Stream rate limited" sleep_seconds =
-                    status_outcome.sleep_seconds
+            _record_stream_outcome_diagnostics!(st, status_outcome)
+            if status_outcome.stop_reason in ("rate_limited", "usage_capped")
+                @warn "Stream rate limited" reason = status_outcome.stop_reason sleep_seconds =
+                    status_outcome.sleep_seconds retry_after =
+                    status_outcome.diagnostics.retry_after rate_limit_reset =
+                    status_outcome.diagnostics.rate_limit_reset
             elseif status_outcome.stop_reason == "server_error"
-                @warn "Stream server error" status = resp.status
+                @warn "Stream server error" status = resp.status detail =
+                    status_outcome.diagnostics.error_detail
             end
             outcome_ref[] = status_outcome
             return nothing
         end
 
         connected_at = stream_now_utc()
+        _finish_stream_gap!(cfg, st, pending_gap, connected_at)
         st.last_connected_at = connected_at
-        st.last_status = 200
-        st.last_error = ""
-        _finish_stream_gap!(
-            cfg,
-            st,
-            pending_gap_start,
-            pending_gap_reason,
-            connected_at,
-        )
+        _clear_stream_diagnostics!(st)
+        st.diagnostics.status = 200
         _maybe_persist_stream_state!(
             cfg,
             st,
@@ -68,7 +62,7 @@ function _open_stream_connection!(
             started_at,
             activity_this_connection,
             state_flush_ref,
-            sleep_fn = sleep_fn,
+            sleep_fn = client.sleep_fn,
         )
         return nothing
     end
@@ -80,19 +74,30 @@ end
 
 function run_stream_collector(
     cfg::StreamConfig;
-    open_http = HTTP.open,
-    sleep_fn = sleep,
-    rand_fn = rand,
+    client::XApiClient = XApiClient(),
+    open_http = nothing,
+    sleep_fn = nothing,
+    rand_fn = nothing,
 )
+    if open_http !== nothing || sleep_fn !== nothing || rand_fn !== nothing
+        client = XApiClient(
+            bearer_token = client.bearer_token,
+            request_fn = client.request_fn,
+            open_fn = open_http === nothing ? client.open_fn : open_http,
+            sleep_fn = sleep_fn === nothing ? client.sleep_fn : sleep_fn,
+            rand_fn = rand_fn === nothing ? client.rand_fn : rand_fn,
+        )
+    end
     validate!(cfg)
     mkpath(cfg.out_dir)
 
-    rule_headers = bearer_headers(user_agent = "julia-x-collector/stream")
+    rule_headers = bearer_headers(client; user_agent = "julia-x-collector/stream")
     stream_headers = bearer_headers(
+        client;
         user_agent = "julia-x-collector/stream",
         accept_encoding = "identity",
     )
-    rule = ensure_stream_rule!(cfg, rule_headers)
+    rule = ensure_stream_rule!(cfg, client, rule_headers)
     query = build_query(cfg)
     sdb = init_seen_db(cfg)
 
@@ -106,8 +111,7 @@ function run_stream_collector(
     st.rule_id = rule.id
     st.completed = false
     st.stop_reason = ""
-    st.last_error = ""
-    st.last_status = 0
+    _clear_stream_diagnostics!(st)
     st.consecutive_failures = 0
     st.seen_count = count_seen(sdb)
     _persist_stream_state!(cfg, st)
@@ -118,8 +122,7 @@ function run_stream_collector(
     started_at = time()
     reconnects = 0
     delay = cfg.reconnect_initial_delay_seconds
-    pending_gap_start = Ref{Union{Nothing,String}}(nothing)
-    pending_gap_reason = Ref("")
+    pending_gap = Ref(StreamGapSnapshot())
     writer = Ref{Union{Nothing,StreamJsonlWriter}}(nothing)
 
     try
@@ -132,8 +135,7 @@ function run_stream_collector(
                 _finish_stream_gap!(
                     cfg,
                     st,
-                    pending_gap_start,
-                    pending_gap_reason,
+                    pending_gap,
                     stream_now_utc(),
                     stop_reason,
                 )
@@ -151,6 +153,7 @@ function run_stream_collector(
             activity_this_connection = Ref(false)
             try
                 outcome = _open_stream_connection!(
+                    client,
                     cfg,
                     st,
                     sdb,
@@ -159,12 +162,9 @@ function run_stream_collector(
                     stream_headers,
                     params,
                     started_at,
-                    pending_gap_start,
-                    pending_gap_reason,
+                    pending_gap,
                     state_flush_ref,
-                    activity_this_connection;
-                    open_http = open_http,
-                    sleep_fn = sleep_fn,
+                    activity_this_connection,
                 )
 
                 if st.completed
@@ -179,18 +179,35 @@ function run_stream_collector(
 
                 if !isempty(outcome.stop_reason)
                     st.stop_reason = outcome.stop_reason
-                    outcome.status > 0 && (st.last_status = outcome.status)
-                    st.last_error = outcome.error
+                    _record_stream_outcome_diagnostics!(st, outcome)
                     if outcome.kind in (:retryable, :disconnected)
                         _begin_stream_gap!(
                             st,
-                            pending_gap_start,
-                            pending_gap_reason,
+                            pending_gap,
                             outcome.stop_reason,
                         )
                     end
                     _persist_stream_state!(cfg, st)
                     state_flush_ref[] = time()
+                end
+
+                if outcome.kind == :terminal
+                    _begin_stream_gap!(
+                        st,
+                        pending_gap,
+                        outcome.stop_reason,
+                    )
+                    st.completed = false
+                    _finish_stream_gap!(
+                        cfg,
+                        st,
+                        pending_gap,
+                        stream_now_utc(),
+                        outcome.stop_reason,
+                    )
+                    _persist_stream_state!(cfg, st)
+                    state_flush_ref[] = time()
+                    break
                 end
 
                 decision = _stream_reconnect_decision(cfg, reconnects)
@@ -203,8 +220,7 @@ function run_stream_collector(
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         st.stop_reason,
                     )
@@ -216,8 +232,8 @@ function run_stream_collector(
                 state_flush_ref[] = time()
                 sleep_seconds =
                     outcome.sleep_seconds > 0 ? outcome.sleep_seconds :
-                    delay + rand_fn() * 0.5
-                sleep_fn(sleep_seconds)
+                    delay + client.rand_fn() * 0.5
+                client.sleep_fn(sleep_seconds)
                 delay = min(delay * 1.8, cfg.reconnect_max_delay_seconds)
 
             catch e
@@ -226,8 +242,7 @@ function run_stream_collector(
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         "interrupted",
                     )
@@ -237,13 +252,16 @@ function run_stream_collector(
                 api_error = _unwrap_x_api_access_error(e)
                 if api_error !== nothing
                     st.stop_reason = "api_error"
-                    st.last_status = api_error.status
-                    st.last_error = _safe_showerror_text(api_error)
+                    st.diagnostics = StreamDiagnostics(
+                        error = _safe_showerror_text(api_error),
+                        status = api_error.status,
+                        error_type = "api_error",
+                        error_detail = api_error.body,
+                    )
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         "api_error",
                     )
@@ -258,8 +276,7 @@ function run_stream_collector(
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         stop_reason,
                     )
@@ -268,7 +285,7 @@ function run_stream_collector(
                     break
                 end
 
-                if activity_this_connection[]
+                if activity_this_connection[] && !_looks_like_stream_timeout(e)
                     reconnects = 0
                     delay = cfg.reconnect_initial_delay_seconds
                     st.consecutive_failures = 0
@@ -277,12 +294,15 @@ function run_stream_collector(
                 error_text = _safe_showerror_text(e)
                 reason = _looks_like_stream_timeout(e) ? "idle_timeout" : "stream_error"
                 st.stop_reason = reason
-                st.last_status = 0
-                st.last_error = error_text
+                st.diagnostics = StreamDiagnostics(
+                    error = error_text,
+                    status = 0,
+                    error_type = reason,
+                    error_detail = error_text,
+                )
                 _begin_stream_gap!(
                     st,
-                    pending_gap_start,
-                    pending_gap_reason,
+                    pending_gap,
                     reason,
                 )
 
@@ -292,8 +312,7 @@ function run_stream_collector(
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         "idle_timeout",
                     )
@@ -313,8 +332,7 @@ function run_stream_collector(
                     _finish_stream_gap!(
                         cfg,
                         st,
-                        pending_gap_start,
-                        pending_gap_reason,
+                        pending_gap,
                         stream_now_utc(),
                         st.stop_reason,
                     )
@@ -324,7 +342,7 @@ function run_stream_collector(
                 end
                 _persist_stream_state!(cfg, st)
                 state_flush_ref[] = time()
-                sleep_fn(delay + rand_fn() * 0.5)
+                client.sleep_fn(delay + client.rand_fn() * 0.5)
                 delay = min(delay * 1.8, cfg.reconnect_max_delay_seconds)
             end
         end
@@ -334,8 +352,7 @@ function run_stream_collector(
             _finish_stream_gap!(
                 cfg,
                 st,
-                pending_gap_start,
-                pending_gap_reason,
+                pending_gap,
                 stream_now_utc(),
                 "disconnected",
             )

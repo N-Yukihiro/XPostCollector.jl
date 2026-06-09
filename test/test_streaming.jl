@@ -95,8 +95,8 @@ end
             @test result.created == true
             @test result.id == "new-rule"
             @test methods == ["GET", "POST", "POST"]
-            @test bodies[2]["delete"]["ids"] == ["old-rule"]
-            @test haskey(bodies[3], "add")
+            @test haskey(bodies[2], "add")
+            @test bodies[3]["delete"]["ids"] == ["old-rule"]
         end
     end
 end
@@ -162,6 +162,29 @@ end
             )
 
             cfg.replace_rule_by_tag = true
+            replace_add_failure_bodies = Any[]
+            replace_add_failure_stub =
+                (method, url, headers, params; body = nothing, max_retries = 6, readtimeout = 30) -> begin
+                    if method == "GET"
+                        return Dict(
+                            "data" => Any[
+                                Dict("id" => "old-rule", "value" => "other", "tag" => cfg.rule_tag),
+                            ],
+                        )
+                    end
+                    push!(replace_add_failure_bodies, body)
+                    haskey(body, "delete") && error("delete should not run when replacement add fails")
+                    return Dict("errors" => Any[Dict("detail" => "bad replacement")])
+                end
+            @test_throws ErrorException ensure_stream_rule!(
+                cfg,
+                headers,
+                replace_add_failure_stub,
+            )
+            @test length(replace_add_failure_bodies) == 1
+            @test haskey(replace_add_failure_bodies[1], "add")
+
+            delete_failure_bodies = Any[]
             delete_failure_stub =
                 (method, url, headers, params; body = nothing, max_retries = 6, readtimeout = 30) -> begin
                     if method == "GET"
@@ -171,12 +194,20 @@ end
                             ],
                         )
                     end
+                    push!(delete_failure_bodies, body)
                     if haskey(body, "delete")
                         return Dict("meta" => Dict("summary" => Dict("not_deleted" => 1)))
                     end
-                    return Dict("data" => Any[])
+                    add = body["add"][1]
+                    return Dict(
+                        "data" => Any[
+                            Dict("id" => "new-rule", "value" => add["value"], "tag" => add["tag"]),
+                        ],
+                    )
             end
             @test_throws ErrorException ensure_stream_rule!(cfg, headers, delete_failure_stub)
+            @test haskey(delete_failure_bodies[1], "add")
+            @test delete_failure_bodies[2]["delete"]["ids"] == ["old-rule"]
 
             methods = String[]
             missing_id_stub =
@@ -279,6 +310,36 @@ end
     @test _looks_like_stream_timeout(BinaryShowError()) == false
 end
 
+@testset "list_stream_connections requests active filtered stream diagnostics" begin
+    with_temp_stream_cfg(task = "stream_connections") do cfg, dir
+        with_env_token() do
+            captured = Ref{Any}(nothing)
+            fetch_stub =
+                (method, url, headers, params; body = nothing, max_retries = 6, readtimeout = 30) -> begin
+                    captured[] = (method = method, url = url, params = copy(params))
+                    return Dict("data" => Any[], "meta" => Dict("result_count" => 0))
+                end
+
+            res = list_stream_connections(
+                cfg,
+                ["Authorization" => "Bearer dummy"],
+                fetch_stub;
+                status = "active",
+                endpoints = "filtered_stream",
+                max_results = 25,
+            )
+
+            @test haskey(res, "data")
+            @test captured[].method == "GET"
+            @test endswith(captured[].url, "/2/connections")
+            @test captured[].params["status"] == "active"
+            @test captured[].params["endpoints"] == "filtered_stream"
+            @test captured[].params["max_results"] == "25"
+            @test occursin("disconnect_reason", captured[].params["connection.fields"])
+        end
+    end
+end
+
 @testset "stream response and reconnect helpers classify outcomes" begin
     ok = _stream_response_outcome(HTTP.Response(200), "http://x.test")
     @test ok.kind == :ok
@@ -287,6 +348,31 @@ end
         _stream_response_outcome(HTTP.Response(429, ["retry-after" => "1"]), "http://x.test")
     @test limited.kind == :retryable
     @test limited.stop_reason == "rate_limited"
+    @test limited.sleep_seconds == 60
+    @test limited.diagnostics.retry_after == 1
+
+    usage_body = """{"type":"https://api.x.com/2/problems/usage-capped","detail":"Usage cap exceeded"}"""
+    usage = _stream_response_outcome(
+        HTTP.Response(
+            429,
+            [
+                "retry-after" => "5",
+                "x-rate-limit-limit" => "50",
+                "x-rate-limit-remaining" => "0",
+                "x-rate-limit-reset" => "123",
+            ],
+        ),
+        "http://x.test";
+        body = usage_body,
+    )
+    @test usage.stop_reason == "usage_capped"
+    @test usage.kind == :terminal
+    @test usage.sleep_seconds == 0
+    @test usage.diagnostics.error_type == "https://api.x.com/2/problems/usage-capped"
+    @test usage.diagnostics.error_detail == "Usage cap exceeded"
+    @test usage.diagnostics.rate_limit_limit == 50
+    @test usage.diagnostics.rate_limit_remaining == 0
+    @test usage.diagnostics.rate_limit_reset == 123
 
     server = _stream_response_outcome(HTTP.Response(503), "http://x.test")
     @test server.kind == :retryable
@@ -319,6 +405,367 @@ end
     disabled = _stream_reconnect_decision(cfg, 0)
     @test disabled.should_reconnect == false
     @test disabled.stop_reason == ""
+end
+
+@testset "run_stream_collector stops terminal usage cap without reconnecting" begin
+    with_temp_stream_cfg(task = "stream_usage_capped") do cfg, dir
+        with_logger(NullLogger()) do
+            cfg.manage_rules = false
+            cfg.max_posts = 1
+            cfg.max_reconnects = 0
+            attempts = Ref(0)
+            sleep_calls = Ref(0)
+            fake_open_http =
+                (
+                    callback,
+                    method,
+                    url,
+                    headers;
+                    query = nothing,
+                    status_exception = true,
+                    readtimeout = -1,
+                    decompress = nothing,
+                ) -> begin
+                    attempts[] += 1
+                    response = HTTP.Response(
+                        429,
+                        [
+                            "retry-after" => "5",
+                            "x-rate-limit-limit" => "50",
+                            "x-rate-limit-remaining" => "0",
+                            "x-rate-limit-reset" => "123",
+                        ],
+                    )
+                    body = """{"type":"https://api.x.com/2/problems/usage-capped","detail":"Usage cap exceeded"}"""
+                    return callback(FakeHTTPStream(response, [collect(codeunits(body))]))
+                end
+
+            client = XApiClient(
+                bearer_token = "dummy",
+                open_fn = fake_open_http,
+                sleep_fn = _ -> (sleep_calls[] += 1),
+                rand_fn = () -> 0.0,
+            )
+            st = run_stream_collector(cfg; client = client)
+
+            @test attempts[] == 1
+            @test sleep_calls[] == 0
+            @test st.completed == false
+            @test st.stop_reason == "usage_capped"
+            @test st.diagnostics.status == 429
+            @test st.diagnostics.error_type == "https://api.x.com/2/problems/usage-capped"
+            @test st.diagnostics.retry_after == 5
+            gaps = readlines(out_stream_gaps(cfg))
+            @test length(gaps) == 1
+            gap = JSON3.read(gaps[1])
+            @test gap["reason"] == "usage_capped"
+            @test gap["status"] == 429
+            @test gap["error_type"] == "https://api.x.com/2/problems/usage-capped"
+            @test gap["retry_after"] == 5
+        end
+    end
+end
+
+@testset "stream rate limit diagnostics are persisted in gap records" begin
+    with_temp_stream_cfg(task = "stream_rate_diag") do cfg, dir
+        st = StreamState()
+        st.task_name = cfg.task_name
+        st.query = build_query(cfg)
+        st.rule_tag = cfg.rule_tag
+        st.rule_id = "rule-1"
+        outcome = _stream_response_outcome(
+            HTTP.Response(
+                429,
+                [
+                    "retry-after" => "5",
+                    "x-rate-limit-limit" => "50",
+                    "x-rate-limit-remaining" => "0",
+                    "x-rate-limit-reset" => "123",
+                ],
+            ),
+            "http://x.test";
+            body = """{"type":"https://api.x.com/2/problems/rate-limit-exceeded","detail":"Rate limit exceeded"}""",
+        )
+        XPostCollector._record_stream_outcome_diagnostics!(st, outcome)
+        _write_stream_gap!(
+            cfg,
+            st,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:30Z",
+            outcome.stop_reason,
+        )
+        obj = JSON3.read(readline(out_stream_gaps(cfg)))
+        @test obj["reason"] == "rate_limited"
+        @test obj["status"] == 429
+        @test obj["error_type"] == "https://api.x.com/2/problems/rate-limit-exceeded"
+        @test obj["rate_limit_limit"] == 50
+        @test obj["rate_limit_remaining"] == 0
+        @test obj["rate_limit_reset"] == 123
+        @test obj["retry_after"] == 5
+    end
+end
+
+@testset "run_stream_collector sends configured stream readtimeout" begin
+    with_temp_stream_cfg(task = "stream_readtimeout") do cfg, dir
+        with_env_token() do
+            with_logger(NullLogger()) do
+                cfg.manage_rules = false
+                cfg.max_posts = 1
+                cfg.http_readtimeout_seconds = 0
+                cfg.idle_timeout_seconds = 123
+                captured_readtimeout = Ref(-1)
+                fake_open_http =
+                    (
+                        callback,
+                        method,
+                        url,
+                        headers;
+                        query = nothing,
+                        status_exception = true,
+                        readtimeout = -1,
+                        decompress = nothing,
+                    ) -> begin
+                        captured_readtimeout[] = readtimeout
+                        response = HTTP.Response(200, ["Content-Type" => "application/json"])
+                        stream = FakeHTTPStream(
+                            response,
+                            [collect(codeunits(stream_event_json("readtimeout-1") * "\n"))],
+                        )
+                        return callback(stream)
+                    end
+
+                st = run_stream_collector(
+                    cfg;
+                    open_http = fake_open_http,
+                    sleep_fn = _ -> nothing,
+                    rand_fn = () -> 0.0,
+                )
+                @test captured_readtimeout[] == 123
+                @test st.total_tweets == 1
+                @test st.completed == true
+                @test st.stop_reason == "max_posts"
+            end
+        end
+    end
+
+    with_temp_stream_cfg(task = "stream_readtimeout_override") do cfg, dir
+        with_env_token() do
+            with_logger(NullLogger()) do
+                cfg.manage_rules = false
+                cfg.max_posts = 1
+                cfg.idle_timeout_seconds = 123
+                cfg.http_readtimeout_seconds = 45
+                captured_readtimeout = Ref(-1)
+                fake_open_http =
+                    (
+                        callback,
+                        method,
+                        url,
+                        headers;
+                        query = nothing,
+                        status_exception = true,
+                        readtimeout = -1,
+                        decompress = nothing,
+                    ) -> begin
+                        captured_readtimeout[] = readtimeout
+                        response = HTTP.Response(200, ["Content-Type" => "application/json"])
+                        stream = FakeHTTPStream(
+                            response,
+                            [collect(codeunits(stream_event_json("readtimeout-override") * "\n"))],
+                        )
+                        return callback(stream)
+                    end
+
+                st = run_stream_collector(
+                    cfg;
+                    open_http = fake_open_http,
+                    sleep_fn = _ -> nothing,
+                    rand_fn = () -> 0.0,
+                )
+                @test captured_readtimeout[] == 45
+                @test st.total_tweets == 1
+                @test st.completed == true
+                @test st.stop_reason == "max_posts"
+            end
+        end
+    end
+end
+
+@testset "run_stream_collector preserves retryable gap diagnostics after reconnect" begin
+    with_temp_stream_cfg(task = "stream_429_gap_snapshot") do cfg, dir
+        with_env_token() do
+            with_logger(NullLogger()) do
+                cfg.manage_rules = false
+                cfg.max_posts = 1
+                cfg.max_reconnects = 1
+                attempts = Ref(0)
+                fake_open_http =
+                    (
+                        callback,
+                        method,
+                        url,
+                        headers;
+                        query = nothing,
+                        status_exception = true,
+                        readtimeout = -1,
+                        decompress = nothing,
+                    ) -> begin
+                        attempts[] += 1
+                        if attempts[] == 1
+                            response = HTTP.Response(
+                                429,
+                                [
+                                    "retry-after" => "5",
+                                    "x-rate-limit-limit" => "50",
+                                    "x-rate-limit-remaining" => "0",
+                                    "x-rate-limit-reset" => "123",
+                                ],
+                            )
+                            body = """{"type":"https://api.x.com/2/problems/rate-limit-exceeded","detail":"Rate limit exceeded"}"""
+                            return callback(
+                                FakeHTTPStream(response, [collect(codeunits(body))]),
+                            )
+                        end
+                        response = HTTP.Response(200, ["Content-Type" => "application/json"])
+                        return callback(
+                            FakeHTTPStream(
+                                response,
+                                [collect(codeunits(stream_event_json("after-429") * "\n"))],
+                            ),
+                        )
+                    end
+
+                st = run_stream_collector(
+                    cfg;
+                    open_http = fake_open_http,
+                    sleep_fn = _ -> nothing,
+                    rand_fn = () -> 0.0,
+                )
+                @test attempts[] == 2
+                @test st.total_tweets == 1
+                @test st.diagnostics.status == 200
+                gaps = readlines(out_stream_gaps(cfg))
+                @test length(gaps) == 1
+                gap = JSON3.read(gaps[1])
+                @test gap["reason"] == "rate_limited"
+                @test gap["status"] == 429
+                @test gap["error_type"] == "https://api.x.com/2/problems/rate-limit-exceeded"
+                @test gap["error_detail"] == "Rate limit exceeded"
+                @test gap["rate_limit_limit"] == 50
+                @test gap["rate_limit_remaining"] == 0
+                @test gap["rate_limit_reset"] == 123
+                @test gap["retry_after"] == 5
+            end
+        end
+    end
+
+    with_temp_stream_cfg(task = "stream_503_gap_snapshot") do cfg, dir
+        with_env_token() do
+            with_logger(NullLogger()) do
+                cfg.manage_rules = false
+                cfg.max_posts = 1
+                cfg.max_reconnects = 1
+                attempts = Ref(0)
+                fake_open_http =
+                    (
+                        callback,
+                        method,
+                        url,
+                        headers;
+                        query = nothing,
+                        status_exception = true,
+                        readtimeout = -1,
+                        decompress = nothing,
+                    ) -> begin
+                        attempts[] += 1
+                        if attempts[] == 1
+                            response = HTTP.Response(503, ["Content-Type" => "application/json"])
+                            body = """{"type":"https://api.x.com/2/problems/server-error","detail":"Server unavailable"}"""
+                            return callback(
+                                FakeHTTPStream(response, [collect(codeunits(body))]),
+                            )
+                        end
+                        response = HTTP.Response(200, ["Content-Type" => "application/json"])
+                        return callback(
+                            FakeHTTPStream(
+                                response,
+                                [collect(codeunits(stream_event_json("after-503-snapshot") * "\n"))],
+                            ),
+                        )
+                    end
+
+                st = run_stream_collector(
+                    cfg;
+                    open_http = fake_open_http,
+                    sleep_fn = _ -> nothing,
+                    rand_fn = () -> 0.0,
+                )
+                @test attempts[] == 2
+                @test st.total_tweets == 1
+                @test st.diagnostics.status == 200
+                gaps = readlines(out_stream_gaps(cfg))
+                @test length(gaps) == 1
+                gap = JSON3.read(gaps[1])
+                @test gap["reason"] == "server_error"
+                @test gap["status"] == 503
+                @test gap["error_type"] == "https://api.x.com/2/problems/server-error"
+                @test gap["error_detail"] == "Server unavailable"
+            end
+        end
+    end
+end
+
+@testset "run_stream_collector records idle timeout gap before reconnect" begin
+    with_temp_stream_cfg(task = "stream_idle_timeout_gap") do cfg, dir
+        with_env_token() do
+            with_logger(NullLogger()) do
+                cfg.manage_rules = false
+                cfg.max_posts = 1
+                cfg.max_reconnects = 1
+                attempts = Ref(0)
+                fake_open_http =
+                    (
+                        callback,
+                        method,
+                        url,
+                        headers;
+                        query = nothing,
+                        status_exception = true,
+                        readtimeout = -1,
+                        decompress = nothing,
+                    ) -> begin
+                        attempts[] += 1
+                        if attempts[] == 1
+                            throw(ErrorException("TimeoutError: Connection closed after $readtimeout seconds"))
+                        end
+                        response = HTTP.Response(200, ["Content-Type" => "application/json"])
+                        return callback(
+                            FakeHTTPStream(
+                                response,
+                                [collect(codeunits(stream_event_json("after-timeout") * "\n"))],
+                            ),
+                        )
+                    end
+
+                st = run_stream_collector(
+                    cfg;
+                    open_http = fake_open_http,
+                    sleep_fn = _ -> nothing,
+                    rand_fn = () -> 0.0,
+                )
+                @test attempts[] == 2
+                @test st.total_tweets == 1
+                @test st.diagnostics.status == 200
+                gaps = readlines(out_stream_gaps(cfg))
+                @test length(gaps) == 1
+                gap = JSON3.read(gaps[1])
+                @test gap["reason"] == "idle_timeout"
+                @test gap["error_type"] == "idle_timeout"
+                @test occursin("TimeoutError", gap["error_detail"])
+                @test !haskey(gap, "status")
+            end
+        end
+    end
 end
 
 @testset "run_stream_collector retries 503 without response/outcome confusion" begin
@@ -354,7 +801,7 @@ end
                     @test st.total_tweets == 1
                     @test st.completed == true
                     @test st.stop_reason == "max_posts"
-                    @test st.last_status == 200
+                    @test st.diagnostics.status == 200
                     gaps = readlines(out_stream_gaps(cfg))
                     @test length(gaps) == 1
                     @test JSON3.read(gaps[1])["reason"] == "server_error"

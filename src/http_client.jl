@@ -1,6 +1,31 @@
 # =========================================================
 # HTTP + Retry / API errors / usage
 # =========================================================
+Base.@kwdef struct XApiClient
+    bearer_token::String = get(ENV, "BEARER_TOKEN", "")
+    request_fn::Function = HTTP.request
+    open_fn::Function = HTTP.open
+    sleep_fn::Function = sleep
+    rand_fn::Function = rand
+end
+
+function bearer_headers(
+    client::XApiClient;
+    user_agent::AbstractString = "julia-x-collector/repl",
+    accept_encoding::Union{Nothing,AbstractString} = nothing,
+)
+    isempty(client.bearer_token) && error("BEARER_TOKEN is missing (env/.env)")
+    headers = [
+        "Authorization" => "Bearer $(client.bearer_token)",
+        "User-Agent" => String(user_agent),
+    ]
+    accept_encoding !== nothing &&
+        push!(headers, "Accept-Encoding" => String(accept_encoding))
+    return headers
+end
+
+bearer_headers(; kwargs...) = bearer_headers(XApiClient(); kwargs...)
+
 function rate_limit_sleep_seconds(resp; min_backoff_seconds = 30)::Int
     retry_after = try
         v = HTTP.header(resp, "retry-after")
@@ -197,61 +222,163 @@ function _looks_like_full_archive_access_error(
            occursin("access", s)
 end
 
-# ★ 重要：url を引数に取る（テストでスタブ差し替え可能にする）
+function _request_body_bytes(body)
+    body === nothing && return UInt8[]
+    return Vector{UInt8}(JSON3.write(body))
+end
+
+function _request_headers(headers, body)
+    request_headers = collect(headers)
+    body !== nothing && push!(request_headers, "Content-Type" => "application/json")
+    return request_headers
+end
+
+function _sleep_with_jitter!(client::XApiClient, wait_sec::Real, jitter::Real = 0.5)
+    client.sleep_fn(Float64(wait_sec) + client.rand_fn() * Float64(jitter))
+    return nothing
+end
+
+function _throw_default_x_api_error(resp, url::AbstractString)
+    body = _extract_x_api_error_detail(_body_to_text(resp))
+    throw(XApiAccessError(resp.status, String(url), body))
+end
+
+function _throw_search_api_error(resp, url::AbstractString)
+    body = _extract_x_api_error_detail(_body_to_text(resp))
+    if 400 <= resp.status < 500 && resp.status != 429
+        if resp.status == 400 && _looks_like_invalid_pagination_token(body)
+            throw(InvalidPaginationTokenError(resp.status, body))
+        elseif _looks_like_full_archive_access_error(resp.status, url, body)
+            throw(FullArchiveAccessError(resp.status, String(url), body))
+        end
+    end
+    throw(XApiAccessError(resp.status, String(url), body))
+end
+
+function _request_json_with_retry(
+    client::XApiClient,
+    method::AbstractString,
+    url::AbstractString,
+    headers,
+    params::Dict{String,String} = Dict{String,String}();
+    body = nothing,
+    max_retries::Int = 6,
+    readtimeout::Int = 30,
+    success_status::Function = status -> status == 200,
+    context::AbstractString = "X API",
+    max_retries_message::AbstractString = "$(context) max retries exceeded",
+    error_handler::Function = _throw_default_x_api_error,
+)
+    wait_sec = 5.0
+    request_headers = _request_headers(headers, body)
+    request_body = _request_body_bytes(body)
+    for attempt = 1:max_retries
+        resp = try
+            client.request_fn(
+                String(method),
+                String(url);
+                headers = request_headers,
+                query = params,
+                body = request_body,
+                status_exception = false,
+                readtimeout = readtimeout,
+            )
+        catch e
+            @warn "$(context) IO error" attempt = attempt exception = e
+            _sleep_with_jitter!(client, wait_sec)
+            wait_sec = min(wait_sec * 1.8, 60.0)
+            continue
+        end
+
+        if success_status(resp.status)
+            try
+                return _json_response_body(resp)
+            catch e
+                @warn "$(context) JSON decode failed" attempt = attempt exception = e
+                _sleep_with_jitter!(client, wait_sec)
+                wait_sec = min(wait_sec * 1.6, 60.0)
+            end
+        elseif resp.status == 429
+            s = rate_limit_sleep_seconds(resp)
+            @warn "$(context) rate limited" sleep_seconds = s
+            client.sleep_fn(s)
+        elseif 500 <= resp.status < 600
+            @warn "$(context) server error" status = resp.status attempt = attempt
+            _sleep_with_jitter!(client, wait_sec)
+            wait_sec = min(wait_sec * 2.0, 60.0)
+        else
+            error_handler(resp, url)
+        end
+    end
+    error(String(max_retries_message))
+end
+
 function fetch_with_retry(
+    client::XApiClient,
     url::AbstractString,
     headers,
     params::Dict{String,String};
     max_retries::Int = 6,
 )
-    wait_sec = 5.0
-    for attempt = 1:max_retries
-        resp = try
-            HTTP.get(
-                String(url);
-                headers = headers,
-                query = params,
-                status_exception = false,
-                readtimeout = 30,
-            )
-        catch e
-            @warn "Network/IO error" attempt = attempt exception = e
-            sleep(wait_sec + rand() * 0.5)
-            wait_sec = min(wait_sec * 1.8, 60.0)
-            continue
-        end
-
-        if resp.status == 200
-            try
-                return JSON3.read(String(resp.body))
-            catch e
-                @warn "JSON decode failed" attempt = attempt exception = e
-                sleep(wait_sec + rand() * 0.5)
-                wait_sec = min(wait_sec * 1.6, 60.0)
-            end
-        elseif resp.status == 429
-            s = rate_limit_sleep_seconds(resp)
-            @warn "Rate limited" sleep_seconds = s
-            sleep(s)
-        elseif 500 <= resp.status < 600
-            @warn "Server error" status = resp.status attempt = attempt
-            sleep(wait_sec + rand() * 0.5)
-            wait_sec = min(wait_sec * 2.0, 60.0)
-        else
-            body = _extract_x_api_error_detail(_body_to_text(resp))
-            if 400 <= resp.status < 500 && resp.status != 429
-                if resp.status == 400 && _looks_like_invalid_pagination_token(body)
-                    throw(InvalidPaginationTokenError(resp.status, body))
-                elseif _looks_like_full_archive_access_error(resp.status, url, body)
-                    throw(FullArchiveAccessError(resp.status, String(url), body))
-                end
-                throw(XApiAccessError(resp.status, String(url), body))
-            end
-            throw(XApiAccessError(resp.status, String(url), body))
-        end
-    end
-    error("Max retries exceeded")
+    return _request_json_with_retry(
+        client,
+        "GET",
+        url,
+        headers,
+        params;
+        max_retries = max_retries,
+        context = "Search API",
+        max_retries_message = "Max retries exceeded",
+        error_handler = _throw_search_api_error,
+    )
 end
+
+fetch_with_retry(url::AbstractString, headers, params::Dict{String,String}; max_retries::Int = 6) =
+    fetch_with_retry(XApiClient(), url, headers, params; max_retries = max_retries)
+
+function fetch_stream_json_with_retry(
+    client::XApiClient,
+    method::AbstractString,
+    url::AbstractString,
+    headers,
+    params::Dict{String,String} = Dict{String,String}();
+    body = nothing,
+    max_retries::Int = 6,
+    readtimeout::Int = 30,
+)
+    return _request_json_with_retry(
+        client,
+        method,
+        url,
+        headers,
+        params;
+        body = body,
+        max_retries = max_retries,
+        readtimeout = readtimeout,
+        success_status = status -> 200 <= status < 300,
+        context = "Stream rules API",
+        max_retries_message = "Stream rules max retries exceeded",
+    )
+end
+
+fetch_stream_json_with_retry(
+    method::AbstractString,
+    url::AbstractString,
+    headers,
+    params::Dict{String,String} = Dict{String,String}();
+    body = nothing,
+    max_retries::Int = 6,
+    readtimeout::Int = 30,
+) = fetch_stream_json_with_retry(
+    XApiClient(),
+    method,
+    url,
+    headers,
+    params;
+    body = body,
+    max_retries = max_retries,
+    readtimeout = readtimeout,
+)
 
 Base.@kwdef struct UsageSummary
     project_cap::Union{Missing,Int} = missing
@@ -284,8 +411,14 @@ build_usage_params(cfg::SearchConfig) = begin
     params
 end
 
-function fetch_usage_with_retry(url::AbstractString, headers; max_retries::Int = 6)
+function fetch_usage_with_retry(
+    client::XApiClient,
+    url::AbstractString,
+    headers;
+    max_retries::Int = 6,
+)
     return fetch_usage_with_retry(
+        client,
         url,
         headers,
         Dict{String,String}();
@@ -294,58 +427,51 @@ function fetch_usage_with_retry(url::AbstractString, headers; max_retries::Int =
 end
 
 function fetch_usage_with_retry(
+    client::XApiClient,
     url::AbstractString,
     headers,
     params::Dict{String,String};
     max_retries::Int = 6,
 )
-    wait_sec = 5.0
-    for attempt = 1:max_retries
-        resp = try
-            HTTP.get(
-                String(url);
-                headers = headers,
-                query = params,
-                status_exception = false,
-                readtimeout = 30,
-            )
-        catch e
-            @warn "Usage API IO error" attempt = attempt exception = e
-            sleep(wait_sec + rand() * 0.5)
-            wait_sec = min(wait_sec * 1.8, 60.0)
-            continue
-        end
-
-        if resp.status == 200
-            try
-                return JSON3.read(String(resp.body))
-            catch e
-                @warn "Usage JSON decode failed" attempt = attempt exception = e
-                sleep(wait_sec + rand() * 0.5)
-                wait_sec = min(wait_sec * 1.6, 60.0)
-            end
-        elseif resp.status == 429
-            s = rate_limit_sleep_seconds(resp)
-            @warn "Usage rate limited" sleep_seconds = s
-            sleep(s)
-        elseif 500 <= resp.status < 600
-            @warn "Usage server error" status = resp.status attempt = attempt
-            sleep(wait_sec + rand() * 0.5)
-            wait_sec = min(wait_sec * 2.0, 60.0)
-        else
-            body = _extract_x_api_error_detail(_body_to_text(resp))
-            throw(XApiAccessError(resp.status, String(url), body))
-        end
-    end
-    error("Usage max retries exceeded")
+    return _request_json_with_retry(
+        client,
+        "GET",
+        url,
+        headers,
+        params;
+        max_retries = max_retries,
+        context = "Usage API",
+        max_retries_message = "Usage max retries exceeded",
+    )
 end
 
-function maybe_check_usage(cfg::SearchConfig, headers, st::CollectorState)
+fetch_usage_with_retry(url::AbstractString, headers; max_retries::Int = 6) =
+    fetch_usage_with_retry(XApiClient(), url, headers; max_retries = max_retries)
+
+fetch_usage_with_retry(
+    url::AbstractString,
+    headers,
+    params::Dict{String,String};
+    max_retries::Int = 6,
+) = fetch_usage_with_retry(
+    XApiClient(),
+    url,
+    headers,
+    params;
+    max_retries = max_retries,
+)
+
+function maybe_check_usage(
+    cfg::SearchConfig,
+    client::XApiClient,
+    headers,
+    st::CollectorState,
+)
     cfg.usage_check_every_pages <= 0 && return nothing
     st.page_count <= 0 && return nothing
     (st.page_count % cfg.usage_check_every_pages == 0) || return nothing
 
-    raw = fetch_usage_with_retry(cfg.usage_url, headers, build_usage_params(cfg))
+    raw = fetch_usage_with_retry(client, cfg.usage_url, headers, build_usage_params(cfg))
     summary = parse_usage_summary(raw)
 
     @info "Usage snapshot" project_usage = summary.project_usage project_cap =
@@ -353,3 +479,6 @@ function maybe_check_usage(cfg::SearchConfig, headers, st::CollectorState)
         summary.cap_reset_day
     return summary
 end
+
+maybe_check_usage(cfg::SearchConfig, headers, st::CollectorState) =
+    maybe_check_usage(cfg, XApiClient(), headers, st)

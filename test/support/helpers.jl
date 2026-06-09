@@ -247,6 +247,32 @@ end
 
 Base.eof(::FakeEmptyNonEofStream) = false
 
+mutable struct FakeHTTPStream
+    response
+    chunks::Vector{Vector{UInt8}}
+    calls::Int
+end
+
+FakeHTTPStream(response, chunks::Vector{Vector{UInt8}}) =
+    FakeHTTPStream(response, chunks, 0)
+
+HTTP.startread(s::FakeHTTPStream) = s.response
+
+function Base.readavailable(s::FakeHTTPStream)
+    s.calls += 1
+    isempty(s.chunks) && return UInt8[]
+    return popfirst!(s.chunks)
+end
+
+function Base.read(s::FakeHTTPStream)
+    isempty(s.chunks) && return UInt8[]
+    data = reduce(vcat, s.chunks; init = UInt8[])
+    empty!(s.chunks)
+    return data
+end
+
+Base.eof(s::FakeHTTPStream) = isempty(s.chunks)
+
 struct FailingIO <: IO end
 Base.write(::FailingIO, ::UInt8) = error("write failed")
 Base.write(::FailingIO, ::StridedVector{UInt8}) = error("write failed")

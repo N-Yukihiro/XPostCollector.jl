@@ -1,88 +1,159 @@
 # =========================================================
 # Filtered Stream
 # =========================================================
-function bearer_headers(;
-    user_agent::AbstractString = "julia-x-collector/repl",
-    accept_encoding::Union{Nothing,AbstractString} = nothing,
-)
-    token = get(ENV, "BEARER_TOKEN", "")
-    isempty(token) && error("BEARER_TOKEN is missing (env/.env)")
-    headers = ["Authorization" => "Bearer $token", "User-Agent" => String(user_agent)]
-    accept_encoding !== nothing &&
-        push!(headers, "Accept-Encoding" => String(accept_encoding))
-    return headers
-end
-
-function fetch_stream_json_with_retry(
-    method::AbstractString,
-    url::AbstractString,
-    headers,
-    params::Dict{String,String} = Dict{String,String}();
-    body = nothing,
-    max_retries::Int = 6,
-    readtimeout::Int = 30,
-)
-    wait_sec = 5.0
-    request_headers = collect(headers)
-    request_body = UInt8[]
-    if body !== nothing
-        push!(request_headers, "Content-Type" => "application/json")
-        request_body = Vector{UInt8}(JSON3.write(body))
+function _stream_field_params(cfg::StreamConfig)
+    if cfg.field_profile === :full
+        params = copy(API_FIELDS)
+    elseif cfg.field_profile === :lean
+        params = copy(STREAM_LEAN_FIELDS)
+    else
+        params = copy(STREAM_MINIMAL_FIELDS)
     end
 
-    for attempt = 1:max_retries
-        resp = try
-            HTTP.request(
-                String(method),
-                String(url);
-                headers = request_headers,
-                query = params,
-                body = request_body,
-                status_exception = false,
-                readtimeout = readtimeout,
-            )
-        catch e
-            @warn "Stream rules API IO error" attempt = attempt exception = e
-            sleep(wait_sec + rand() * 0.5)
-            wait_sec = min(wait_sec * 1.8, 60.0)
-            continue
-        end
-
-        if 200 <= resp.status < 300
-            try
-                return _json_response_body(resp)
-            catch e
-                @warn "Stream rules JSON decode failed" attempt = attempt exception = e
-                sleep(wait_sec + rand() * 0.5)
-                wait_sec = min(wait_sec * 1.6, 60.0)
-            end
-        elseif resp.status == 429
-            s = rate_limit_sleep_seconds(resp)
-            @warn "Stream rules rate limited" sleep_seconds = s
-            sleep(s)
-        elseif 500 <= resp.status < 600
-            @warn "Stream rules server error" status = resp.status attempt = attempt
-            sleep(wait_sec + rand() * 0.5)
-            wait_sec = min(wait_sec * 2.0, 60.0)
-        else
-            body_text = _extract_x_api_error_detail(_body_to_text(resp))
-            throw(XApiAccessError(resp.status, String(url), body_text))
+    if !cfg.write_includes
+        for key in ("expansions", "user.fields", "media.fields", "place.fields", "poll.fields")
+            pop!(params, key, nothing)
         end
     end
-    error("Stream rules max retries exceeded")
+    return params
 end
 
 build_stream_params(cfg::StreamConfig) = begin
     params = Dict{String,String}()
-    for (k, v) in API_FIELDS
+    for (k, v) in _stream_field_params(cfg)
         params[k] = v
     end
     return params
 end
 
-function list_stream_rules(cfg::StreamConfig)
+function list_stream_connections(
+    cfg::StreamConfig;
+    client::XApiClient = XApiClient(),
+    status::AbstractString = "active",
+    endpoints::AbstractString = "filtered_stream",
+    max_results::Integer = 10,
+)
     validate!(cfg)
-    return list_stream_rules(cfg, bearer_headers(user_agent = "julia-x-collector/stream"))
+    headers = bearer_headers(client; user_agent = "julia-x-collector/stream")
+    return list_stream_connections(
+        cfg,
+        client,
+        headers;
+        status = status,
+        endpoints = endpoints,
+        max_results = max_results,
+    )
+end
+
+function list_stream_connections(
+    cfg::StreamConfig,
+    client::XApiClient,
+    fetch_json::Function;
+    status::AbstractString = "active",
+    endpoints::AbstractString = "filtered_stream",
+    max_results::Integer = 10,
+)
+    return list_stream_connections(
+        cfg,
+        bearer_headers(client; user_agent = "julia-x-collector/stream"),
+        fetch_json;
+        status = status,
+        endpoints = endpoints,
+        max_results = max_results,
+    )
+end
+
+function list_stream_connections(
+    cfg::StreamConfig,
+    client::XApiClient,
+    headers;
+    status::AbstractString = "active",
+    endpoints::AbstractString = "filtered_stream",
+    max_results::Integer = 10,
+)
+    return list_stream_connections(
+        cfg,
+        headers,
+        (method, url, headers, params; kwargs...) -> fetch_stream_json_with_retry(
+            client,
+            method,
+            url,
+            headers,
+            params;
+            kwargs...,
+        );
+        status = status,
+        endpoints = endpoints,
+        max_results = max_results,
+    )
+end
+
+function list_stream_connections(
+    cfg::StreamConfig,
+    headers;
+    status::AbstractString = "active",
+    endpoints::AbstractString = "filtered_stream",
+    max_results::Integer = 10,
+)
+    return list_stream_connections(
+        cfg,
+        XApiClient(),
+        headers;
+        status = status,
+        endpoints = endpoints,
+        max_results = max_results,
+    )
+end
+
+function list_stream_connections(
+    cfg::StreamConfig,
+    headers,
+    fetch_json::Function;
+    status::AbstractString = "active",
+    endpoints::AbstractString = "filtered_stream",
+    max_results::Integer = 10,
+)
+    validate!(cfg)
+    params = Dict{String,String}(
+        "status" => String(status),
+        "max_results" => string(clamp(Int(max_results), 1, 100)),
+        "connection.fields" => "id,endpoint_name,connected_at,disconnected_at,disconnect_reason,client_ip",
+    )
+    endpoint_filter = strip(String(endpoints))
+    !isempty(endpoint_filter) && (params["endpoints"] = endpoint_filter)
+    return fetch_json("GET", connections_url(cfg), headers, params)
+end
+
+function list_stream_rules(cfg::StreamConfig; client::XApiClient = XApiClient())
+    validate!(cfg)
+    return list_stream_rules(
+        cfg,
+        client,
+        bearer_headers(client; user_agent = "julia-x-collector/stream"),
+    )
+end
+
+function list_stream_rules(cfg::StreamConfig, client::XApiClient, headers)
+    return list_stream_rules(
+        cfg,
+        headers,
+        (method, url, headers, params; kwargs...) -> fetch_stream_json_with_retry(
+            client,
+            method,
+            url,
+            headers,
+            params;
+            kwargs...,
+        ),
+    )
+end
+
+function list_stream_rules(cfg::StreamConfig, client::XApiClient, fetch_json::Function)
+    return list_stream_rules(
+        cfg,
+        bearer_headers(client; user_agent = "julia-x-collector/stream"),
+        fetch_json,
+    )
 end
 
 function list_stream_rules(cfg::StreamConfig, headers)
@@ -219,9 +290,36 @@ function _stream_rule_delete_ids_or_error(rules, tag::AbstractString)::Vector{St
 end
 
 function ensure_stream_rule!(cfg::StreamConfig)
+    return ensure_stream_rule!(cfg, XApiClient())
+end
+
+function ensure_stream_rule!(cfg::StreamConfig, client::XApiClient)
     validate!(cfg)
-    headers = bearer_headers(user_agent = "julia-x-collector/stream")
-    return ensure_stream_rule!(cfg, headers)
+    headers = bearer_headers(client; user_agent = "julia-x-collector/stream")
+    return ensure_stream_rule!(cfg, client, headers)
+end
+
+function ensure_stream_rule!(cfg::StreamConfig, client::XApiClient, headers)
+    return ensure_stream_rule!(
+        cfg,
+        headers,
+        (method, url, headers, params; kwargs...) -> fetch_stream_json_with_retry(
+            client,
+            method,
+            url,
+            headers,
+            params;
+            kwargs...,
+        ),
+    )
+end
+
+function ensure_stream_rule!(cfg::StreamConfig, client::XApiClient, fetch_json::Function)
+    return ensure_stream_rule!(
+        cfg,
+        bearer_headers(client; user_agent = "julia-x-collector/stream"),
+        fetch_json,
+    )
 end
 
 function ensure_stream_rule!(cfg::StreamConfig, headers)
@@ -246,18 +344,13 @@ function ensure_stream_rule!(cfg::StreamConfig, headers, fetch_json::Function)
         end
     end
 
-    if !isempty(same_tag)
+    replacing_tag = !isempty(same_tag)
+    delete_ids = String[]
+    if replacing_tag
         if !cfg.replace_rule_by_tag
             error("Stream rule tag '$tag' already exists with a different value")
         end
         delete_ids = _stream_rule_delete_ids_or_error(same_tag, tag)
-        delete_res = delete_stream_rules!(
-            cfg,
-            headers,
-            delete_ids,
-            fetch_json,
-        )
-        _assert_stream_rules_response_ok(delete_res; action = :delete)
     end
 
     res = add_stream_rule!(cfg, headers, value, tag, fetch_json)
@@ -268,5 +361,21 @@ function ensure_stream_rule!(cfg::StreamConfig, headers, fetch_json::Function)
     isempty(created_rule.id) &&
         error("Stream rules API add succeeded but the created rule id was not returned")
     rid = created_rule.id
+    if replacing_tag
+        try
+            delete_res = delete_stream_rules!(
+                cfg,
+                headers,
+                delete_ids,
+                fetch_json,
+            )
+            _assert_stream_rules_response_ok(delete_res; action = :delete)
+        catch e
+            old_ids = join(delete_ids, ",")
+            error(
+                "Stream rule tag '$tag' replacement created new rule id '$rid' but failed to delete old rule ids [$old_ids]: $(sprint(showerror, e))",
+            )
+        end
+    end
     return (id = rid, value = value, tag = tag, created = true, response = res)
 end

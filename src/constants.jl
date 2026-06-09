@@ -7,6 +7,7 @@ const PATH_ALL = "/2/tweets/search/all"
 const PATH_STREAM = "/2/tweets/search/stream"
 const PATH_STREAM_RULES = "/2/tweets/search/stream/rules"
 const PATH_USAGE = "/2/usage/tweets"
+const PATH_CONNECTIONS = "/2/connections"
 
 normalize_api_base_url(url::AbstractString) = rstrip(strip(String(url)), '/')
 api_url(base_url::AbstractString, path::AbstractString) =
@@ -25,6 +26,7 @@ endpoint_path(endpoint::Symbol) = endpoint === :all ? PATH_ALL : PATH_RECENT
 endpoint_url(cfg, endpoint::Symbol) = api_url(cfg.api_base_url, endpoint_path(endpoint))
 stream_url(cfg) = api_url(cfg.api_base_url, PATH_STREAM)
 stream_rules_url(cfg) = api_url(cfg.api_base_url, PATH_STREAM_RULES)
+connections_url(cfg) = api_url(cfg.api_base_url, PATH_CONNECTIONS)
 
 # =========================================================
 # Time / format
@@ -118,6 +120,26 @@ const API_FIELDS = Dict{String,String}(
         ],
         ",",
     ),
+)
+
+const STREAM_LEAN_FIELDS = Dict{String,String}(
+    "tweet.fields" => join(
+        [
+            "id",
+            "text",
+            "created_at",
+            "lang",
+            "author_id",
+            "public_metrics",
+        ],
+        ",",
+    ),
+    "expansions" => "author_id",
+    "user.fields" => "id,name,username,verified,protected,public_metrics",
+)
+
+const STREAM_MINIMAL_FIELDS = Dict{String,String}(
+    "tweet.fields" => "id,text,created_at,lang,author_id,public_metrics",
 )
 
 # =========================================================

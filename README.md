@@ -2,8 +2,8 @@
 
 [![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://N-Yukihiro.github.io/XPostCollector.jl/stable/)
 [![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://N-Yukihiro.github.io/XPostCollector.jl/dev/)
-[![Build Status](https://github.com/N-Yukihiro/XPostCollector.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/N-Yukihiro/XPostCollector.jl/actions/workflows/CI.yml?query=branch%3Amaster)
-[![Coverage](https://codecov.io/gh/N-Yukihiro/XPostCollector.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/N-Yukihiro/XPostCollector.jl)
+[![Build Status](https://github.com/N-Yukihiro/XPostCollector.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/N-Yukihiro/XPostCollector.jl/actions/workflows/CI.yml)
+[![Coverage](https://codecov.io/gh/N-Yukihiro/XPostCollector.jl/graph/badge.svg)](https://codecov.io/gh/N-Yukihiro/XPostCollector.jl)
 
 XPostCollector.jl collects posts from the X API v2 search endpoints and filtered
 stream endpoint. It stores raw JSONL safely, keeps state for resumable runs,
@@ -30,6 +30,15 @@ On PowerShell:
 
 ```powershell
 $env:BEARER_TOKEN = "..."
+```
+
+You can also pass an explicit client when you do not want to read the token from
+the environment, or when tests need to inject fake HTTP behavior:
+
+```julia
+client = XApiClient(bearer_token = "...")
+run_collector(cfg; client = client)
+run_stream_collector(stream_cfg; client = client)
 ```
 
 ## REST search collection
@@ -73,10 +82,17 @@ using XPostCollector
 cfg = StreamConfig(
     task_name = "stream_weekly",
     keywords_or = ["Julia"],
+    extra_query_tail = "lang:ja",
     max_seconds = 0,
     max_posts = 0,
+    http_readtimeout_seconds = 0, # auto: use idle_timeout_seconds for HTTP.jl reads
+    idle_timeout_seconds = 120,   # stream inactivity timeout before reconnecting
     reconnect = true,
     max_reconnects = 0,          # unlimited reconnect attempts
+    reconnect_initial_delay_seconds = 60.0,
+    reconnect_max_delay_seconds = 320.0,
+    field_profile = :lean,       # :full keeps the existing rich hydration
+    write_includes = false,      # omit expansions/includes when author/media hydration is unnecessary
     rotate_jsonl_bytes = 1_000_000_000,
     state_flush_interval_seconds = 30.0,
 )
@@ -89,9 +105,18 @@ run_stream_collector(cfg)
 when you want to create or update the configured rule explicitly before opening
 the stream.
 
+When `replace_rule_by_tag = true`, rule replacement creates the new rule before
+deleting old rules with the same tag to avoid stream coverage gaps. If deletion
+fails after creation, inspect `list_stream_rules(cfg)` and clean up the old rule
+IDs reported in the error.
+
 Stream state is written to `task_name.stream.state.json`. Disconnect windows are
 recorded in `task_name.stream.gaps.jsonl` so they can be reviewed or backfilled
 later with REST search.
+
+Use `list_stream_connections(cfg)` to inspect active/historical X streaming
+connections for the authenticated app. This is useful when the API reports a
+connection limit or when you suspect another process is still connected.
 
 ## Output conversion
 

@@ -2,12 +2,15 @@ module XPostCollector
 
 export SearchConfig,
     StreamConfig,
+    XApiClient,
     CollectorState,
     StreamState,
+    StreamDiagnostics,
     validate!,
     run_collector,
     run_stream_collector,
     list_stream_rules,
+    list_stream_connections,
     ensure_stream_rule!,
     convert_outputs,
     convert_outputs_wide

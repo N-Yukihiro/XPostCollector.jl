@@ -23,14 +23,11 @@ build_search_params(
     return params
 end
 
-function run_collector(cfg::SearchConfig)
+function run_collector(cfg::SearchConfig; client::XApiClient = XApiClient())
     validate!(cfg)
     mkpath(cfg.out_dir)
 
-    token = get(ENV, "BEARER_TOKEN", "")
-    isempty(token) && error("BEARER_TOKEN is missing (env/.env)")
-
-    headers = ["Authorization" => "Bearer $token", "User-Agent" => "julia-x-collector/repl"]
+    headers = bearer_headers(client; user_agent = "julia-x-collector/repl")
 
     st = load_state(out_state(cfg))
     prev_conv_offset = st === nothing ? 0 : st.converted_jsonl_offset
@@ -56,6 +53,14 @@ function run_collector(cfg::SearchConfig)
            st.completed &&
            st.next_token === nothing
             @info "Already completed for same window; skip" task = cfg.task_name
+            return st
+        end
+        if same_window &&
+           st.stop_reason == "target_posts" &&
+           cfg.target_posts > 0 &&
+           st.total_tweets >= cfg.target_posts
+            @info "Already stopped at target_posts for same window; skip" task =
+                cfg.task_name target_posts = cfg.target_posts total = st.total_tweets
             return st
         end
 
@@ -88,6 +93,7 @@ function run_collector(cfg::SearchConfig)
     st2.end_time_utc = end_utc
     st2.next_token = resume_next
     st2.completed = false
+    st2.stop_reason = ""
 
     sdb = init_seen_db(cfg)
     last_all_req_time = Ref{Float64}(0.0)
@@ -101,7 +107,7 @@ function run_collector(cfg::SearchConfig)
         if last > 0
             dt = t - last
             if dt < cfg.all_min_interval_seconds
-                sleep(cfg.all_min_interval_seconds - dt)
+                client.sleep_fn(cfg.all_min_interval_seconds - dt)
             end
         end
         last_all_req_time[] = time()
@@ -128,13 +134,14 @@ function run_collector(cfg::SearchConfig)
                     st2.total_tweets
 
                 res = try
-                    fetch_with_retry(url, headers, params)
+                    fetch_with_retry(client, url, headers, params)
                 catch e
                     if e isa InvalidPaginationTokenError
                         @warn "Invalid pagination token; stopping gracefully" exception = e
                         stop_reason = :invalid_pagination_token
                         st2.next_token = nothing
                         st2.completed = true
+                        st2.stop_reason = "invalid_pagination_token"
                         persist_state!()
                         break
                     elseif e isa FullArchiveAccessError
@@ -202,6 +209,7 @@ function run_collector(cfg::SearchConfig)
 
                 st2.next_token = next_token
                 st2.completed = (next_token === nothing)
+                st2.completed && (st2.stop_reason = "completed")
                 persist_state!()
 
                 @info "Page done" page = st2.page_count new_tweets = page_new total =
@@ -209,7 +217,7 @@ function run_collector(cfg::SearchConfig)
 
                 if cfg.usage_check_every_pages > 0
                     try
-                        usage = maybe_check_usage(cfg, headers, st2)
+                        usage = maybe_check_usage(cfg, client, headers, st2)
                         if usage !== nothing &&
                            cfg.drain_to_cap &&
                            !ismissing(usage.remaining) &&
@@ -219,6 +227,7 @@ function run_collector(cfg::SearchConfig)
                                 usage.project_usage project_cap = usage.project_cap
                             st2.next_token = nothing
                             st2.completed = true
+                            st2.stop_reason = "usage_cap_reached"
                             persist_state!()
                             break
                         end
@@ -231,6 +240,8 @@ function run_collector(cfg::SearchConfig)
                     stop_reason = :target_posts
                     @info "Stop by target_posts (page boundary)" target_posts =
                         cfg.target_posts total = st2.total_tweets
+                    st2.stop_reason = "target_posts"
+                    persist_state!()
                     break
                 end
 
